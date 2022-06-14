@@ -94,7 +94,7 @@ impl Camera {
 
         Self {
             rotation_speed: 0.5,
-            movement_speed: 10.0,
+            movement_speed: 60.0,
             position,
             up,
             front,

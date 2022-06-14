@@ -7,7 +7,7 @@ use std::ffi::{self, CStr, CString};
 use std::path::Path;
 
 use crate::camera::Camera;
-use crate::resource::{Buffers, MappedMemory, Mesh, Vertex};
+use crate::resource::{Buffers, Image, Images, MappedMemory, MemoryBlock, Mesh, Vertex};
 
 pub struct Renderer {
     device: Device,
@@ -17,6 +17,7 @@ pub struct Renderer {
     uniform_buffers: UniformBuffers,
     uniform_data: UniformData,
     render_pipeline: Pipeline,
+    render_targets: RenderTargets,
     mesh: Mesh,
     pub camera: Camera,
 }
@@ -31,7 +32,9 @@ impl Renderer {
         };
 
         let swapchain = Swapchain::new(&device, window_extent)?;
-        let render_pass = RenderPass::new(&device, &swapchain)?;
+        let render_targets = RenderTargets::new(&device, &swapchain)?;
+
+        let render_pass = RenderPass::new(&device, &swapchain, &render_targets)?;
         let frame_queue = FrameQueue::new(&device)?;
 
         let uniform_buffers = UniformBuffers::new(&device)?;
@@ -53,6 +56,7 @@ impl Renderer {
             uniform_buffers,
             uniform_data,
             render_pipeline,
+            render_targets,
             mesh,
             camera,
         })
@@ -73,7 +77,9 @@ impl Renderer {
         // Reset command for the current frame.
         unsafe {
             let reset_flags = vk::CommandBufferResetFlags::empty();
-            self.device.handle.reset_command_buffer(frame.command_buffer, reset_flags)?;
+            self.device
+                .handle
+                .reset_command_buffer(frame.command_buffer, reset_flags)?;
         }
 
         let next_image = unsafe {
@@ -95,22 +101,30 @@ impl Renderer {
 
                 // Upload uniform buffer data.
                 self.uniform_data.update(&self.camera);
-                self.uniform_buffers.upload_data(
-                    self.frame_queue.frame_index as u64,
-                    &self.uniform_data,
-                );
+                self.uniform_buffers
+                    .upload_data(self.frame_queue.frame_index as u64, &self.uniform_data);
 
                 // Record the command buffer.
                 unsafe {
                     let begin_info = vk::CommandBufferBeginInfo::builder()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-                    self.device.handle.begin_command_buffer(frame.command_buffer, &begin_info)?;
+                    self.device
+                        .handle
+                        .begin_command_buffer(frame.command_buffer, &begin_info)?;
 
-                    let clear_values = [vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.02, 0.02, 0.02, 1.0],
+                    let clear_values = [
+                        vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: 1.0,
+                                stencil: 0,
+                            },
                         },
-                    }];
+                        vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [0.02, 0.02, 0.02, 1.0],
+                            },
+                        },
+                    ];
 
                     let framebuffer = self.render_pass.framebuffers[image_index as usize];
 
@@ -150,9 +164,9 @@ impl Renderer {
                         frame.command_buffer,
                         0,
                         &[self.mesh.vertex_buffer.handle],
-                        &[0]
+                        &[0],
                     );
-                    
+
                     self.device.handle.cmd_bind_index_buffer(
                         frame.command_buffer,
                         self.mesh.index_buffer.handle,
@@ -170,7 +184,9 @@ impl Renderer {
                     );
 
                     self.device.handle.cmd_end_render_pass(frame.command_buffer);
-                    self.device.handle.end_command_buffer(frame.command_buffer)?;
+                    self.device
+                        .handle
+                        .end_command_buffer(frame.command_buffer)?;
                 }
 
                 // Submit command buffer to be rendered. Wait for semaphore `sync.presented` first and
@@ -209,7 +225,7 @@ impl Renderer {
 
                     self.swapchain
                         .loader
-                        .queue_present(self.device.graphics_queue.handle, &present_info)
+                        .queue_present(self.device.transfer_queue.handle, &present_info)
                         .unwrap();
 
                     Ok(true)
@@ -221,9 +237,16 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, window: &winit::window::Window) -> Result<()> {
+        trace!("resizeing");
+
         unsafe {
-            self.device.handle.device_wait_idle().expect("failed waiting for idle device");
+            self.device
+                .handle
+                .device_wait_idle()
+                .expect("failed waiting for idle device");
+            self.render_targets.destroy(&self.device);
             self.render_pass.destroy(&self.device);
+            self.render_pipeline.destroy(&self.device);
         }
 
         let extent = vk::Extent2D {
@@ -232,7 +255,15 @@ impl Renderer {
         };
 
         self.swapchain.recreate(&self.device, extent)?;
-        self.render_pass = RenderPass::new(&self.device, &self.swapchain)?;
+        self.render_targets = RenderTargets::new(&self.device, &self.swapchain)?;
+        self.render_pass = RenderPass::new(&self.device, &self.swapchain, &self.render_targets)?;
+
+        self.render_pipeline = Pipeline::new_render(
+            &self.device,
+            &self.swapchain,
+            &self.render_pass,
+            &self.uniform_buffers,
+        )?;
 
         let aspect_ratio = extent.width as f32 / extent.height as f32;
         self.camera.update_perspective(aspect_ratio);
@@ -252,6 +283,7 @@ impl Drop for Renderer {
             self.render_pipeline.destroy(&self.device);
             self.uniform_buffers.destroy(&self.device);
             self.frame_queue.destroy(&self.device);
+            self.render_targets.destroy(&self.device);
             self.render_pass.destroy(&self.device);
             self.swapchain.destroy(&self.device);
             self.mesh.destroy(&self.device);
@@ -498,7 +530,8 @@ impl Device {
             )?;
 
             self.handle.queue_wait_idle(self.transfer_queue.handle)?;
-            self.handle.free_command_buffers(self.transfer_pool, &buffers);
+            self.handle
+                .free_command_buffers(self.transfer_pool, &buffers);
         }
 
         Ok(())
@@ -553,25 +586,45 @@ pub struct RenderPass {
 }
 
 impl RenderPass {
-    pub fn new(device: &Device, swapchain: &Swapchain) -> Result<Self> {
-        let attachments = [vk::AttachmentDescription::builder()
-            .format(swapchain.surface_format.format)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .build()];
+    fn new(device: &Device, swapchain: &Swapchain, render_targets: &RenderTargets) -> Result<Self> {
+        let attachments = [
+            // Depth image.
+            vk::AttachmentDescription::builder()
+                .format(DEPTH_IMAGE_FORMAT)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .build(),
+            // Swapchain image.
+            vk::AttachmentDescription::builder()
+                .format(swapchain.surface_format.format)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .build(),
+        ];
 
-        let color_attachment_ref = [vk::AttachmentReference {
+        let depth_attachment = vk::AttachmentReference {
             attachment: 0,
+            layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        };
+
+        let color_attachments = [vk::AttachmentReference {
+            attachment: 1,
             layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         }];
 
         let subpasses = [vk::SubpassDescription::builder()
-            .color_attachments(&color_attachment_ref)
+            .depth_stencil_attachment(&depth_attachment)
+            .color_attachments(&color_attachments)
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .build()];
 
@@ -597,8 +650,9 @@ impl RenderPass {
         let framebuffers: Result<Vec<_>> = swapchain
             .images
             .iter()
-            .map(|image| {
-                let views = [image.view];
+            .zip(render_targets.targets.iter())
+            .map(|(swapchain_image, render_targets)| {
+                let views = [render_targets.depth.view, swapchain_image.view];
                 let info = vk::FramebufferCreateInfo::builder()
                     .render_pass(handle)
                     .attachments(&views)
@@ -685,15 +739,11 @@ pub struct FrameQueue {
 }
 
 impl FrameQueue {
-    /// Have two frames in flight at a time. You could easily have more, but you risk having the CPU
-    /// run multiple frames ahead, which causes latency.
-    const FRAME_COUNT: usize = 2;
-
     pub fn new(device: &Device) -> Result<Self> {
         let command_buffers = unsafe {
             let command_buffer_info = vk::CommandBufferAllocateInfo::builder()
                 .command_pool(device.graphics_pool)
-                .command_buffer_count(Self::FRAME_COUNT as u32);
+                .command_buffer_count(FRAMES_IN_FLIGHT as u32);
 
             device
                 .handle
@@ -712,7 +762,7 @@ impl FrameQueue {
     }
 
     pub fn next_frame(&mut self) {
-        self.frame_index = (self.frame_index + 1) % Self::FRAME_COUNT;
+        self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT
     }
 
     pub fn current_frame(&self) -> &Frame {
@@ -793,6 +843,7 @@ impl Surface {
 }
 
 struct SwapchainImage {
+    #[allow(dead_code)]
     image: vk::Image,
     view: vk::ImageView,
 }
@@ -816,6 +867,82 @@ impl SwapchainImage {
         };
 
         Ok(SwapchainImage { image, view })
+    }
+}
+
+// TODO: Add MSAA here as well.
+struct RenderTarget {
+    depth: Image,
+}
+
+struct RenderTargets {
+    targets: Vec<RenderTarget>,
+    block: MemoryBlock,
+}
+
+impl RenderTargets {
+    fn new(device: &Device, swapchain: &Swapchain) -> Result<Self> {
+        let queue_families = [device.graphics_queue.family_index];
+        let depth_image_info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .format(DEPTH_IMAGE_FORMAT)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .queue_family_indices(&queue_families)
+            .extent(vk::Extent3D {
+                width: swapchain.extent.width,
+                height: swapchain.extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1);
+        let depth_subresource_info = vk::ImageSubresourceRange::builder()
+            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let depth_view_info = vk::ImageViewCreateInfo::builder()
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(DEPTH_IMAGE_FORMAT)
+            .subresource_range(*depth_subresource_info);
+
+        let image_infos = vec![depth_image_info.build(); swapchain.image_count() as usize];
+        let view_infos = vec![depth_view_info.build(); swapchain.image_count() as usize];
+
+        let images = Images::new(
+            device,
+            &image_infos,
+            &view_infos,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+
+        let targets = images
+            .images
+            .iter()
+            .map(|depth| RenderTarget {
+                depth: depth.clone(),
+            })
+            .collect();
+
+        Ok(Self {
+            targets,
+            block: images.block,
+        })
+    }
+
+    /// Destroy and leave `self` in an invalid state.
+    ///
+    /// # Safety
+    ///
+    /// Don't use `self` after calling this function.
+    unsafe fn destroy(&self, device: &Device) {
+        self.targets
+            .iter()
+            .for_each(|target| target.depth.destroy(device));
+        self.block.free(device);
     }
 }
 
@@ -856,6 +983,11 @@ impl Swapchain {
 
         let queue_families = [device.graphics_queue.family_index];
         let min_image_count = 2.max(surface_caps.min_image_count);
+
+        println!(
+            "min: {}, max: {}",
+            surface_caps.min_image_count, surface_caps.max_image_count
+        );
 
         let surface_format = surface_formats
             .iter()
@@ -970,6 +1102,7 @@ impl Swapchain {
         }
 
         self.handle = new;
+        self.extent = extent;
 
         let images = unsafe { self.loader.get_swapchain_images(self.handle)? };
         let images: Result<Vec<_>> = images
@@ -1028,14 +1161,14 @@ impl UniformBuffers {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .size(std::mem::size_of::<UniformData>() as u64);
 
-        let create_infos = [create_info.build(); FrameQueue::FRAME_COUNT];
+        let create_infos = [create_info.build(); FRAMES_IN_FLIGHT];
         let alignment = device.device_properties.limits.non_coherent_atom_size;
 
         let memory_flags =
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
         let buffers = Buffers::new(device, &create_infos, memory_flags, alignment)?;
-        let mapped = buffers.block.map_all(device)?;
+        let mapped = buffers.block.map(device)?;
 
         Ok(UniformBuffers { buffers, mapped })
     }
@@ -1139,7 +1272,7 @@ impl Pipeline {
         let descriptor_pool = unsafe {
             let sizes = [vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: FrameQueue::FRAME_COUNT as u32,
+                descriptor_count: FRAMES_IN_FLIGHT as u32,
             }];
 
             let info = vk::DescriptorPoolCreateInfo::builder()
@@ -1166,7 +1299,7 @@ impl Pipeline {
         };
 
         let descriptor_sets = unsafe {
-            let layouts = vec![descriptor_layout; FrameQueue::FRAME_COUNT];
+            let layouts = vec![descriptor_layout; FRAMES_IN_FLIGHT];
             let alloc_info = vk::DescriptorSetAllocateInfo::builder()
                 .descriptor_pool(descriptor_pool)
                 .set_layouts(&layouts);
@@ -1245,6 +1378,11 @@ impl Pipeline {
             device.handle.create_pipeline_layout(&info, None)?
         };
 
+        let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::builder()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+
         let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
             .stages(&shader_stages)
             .vertex_input_state(&vert_input_info)
@@ -1252,6 +1390,7 @@ impl Pipeline {
             .viewport_state(&viewport_info)
             .rasterization_state(&rasterize_info)
             .multisample_state(&multisample_info)
+            .depth_stencil_state(&depth_stencil_info)
             .color_blend_state(&color_blend_info)
             .layout(layout)
             .render_pass(render_pass.handle)
@@ -1323,3 +1462,10 @@ unsafe extern "system" fn debug_callback(
 
     vk::FALSE
 }
+
+/// The number of frames being worked on concurrently. This could easily be higher, you could for
+/// instance work on all swapchain images concurrently, but you risk having the CPU run ahead,
+/// which add latency and delays. You also save some memory by having less depth buffers and such.
+const FRAMES_IN_FLIGHT: usize = 2;
+
+const DEPTH_IMAGE_FORMAT: vk::Format = vk::Format::D32_SFLOAT;

@@ -85,6 +85,7 @@ fn main() -> Result<()> {
             last_update = Instant::now();
 
             if let Some(left) = Duration::from_millis(16).checked_sub(last_draw.elapsed()) {
+                trace!("sleep for {left:?}");
                 *controlflow = ControlFlow::WaitUntil(Instant::now() + left);
             } else {
                 window.request_redraw();

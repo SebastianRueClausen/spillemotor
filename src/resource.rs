@@ -1,8 +1,8 @@
 use anyhow::Result;
 use ash::vk;
 
-use std::path::Path;
 use std::ops::Range;
+use std::path::Path;
 
 use crate::core::Device;
 
@@ -15,25 +15,17 @@ pub struct MappedMemory {
 
 impl MappedMemory {
     pub unsafe fn as_slice<T: Sized>(&self) -> &mut [T] {
-        let element_count = self.size as usize / std::mem::size_of::<T>();
-
-        std::slice::from_raw_parts_mut(self.as_ptr(), element_count)
+        std::slice::from_raw_parts_mut(self.as_ptr(), self.size as usize / std::mem::size_of::<T>())
     }
 
     pub unsafe fn as_ptr<T: Sized>(&self) -> *mut T {
         self.ptr as *mut T
     }
 
-    pub unsafe fn fill<T: Sized>(&mut self, data: &[T]) -> Result<()> {
-        if data.len() * std::mem::size_of::<T>() > self.size as usize {
-            return Err(anyhow!("`data` is larger than mapped memory"));
-        }
-
-        let ptr = self.ptr as *mut T;
-
-        ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
-
-        Ok(())
+    pub unsafe fn get_range(&self, range: &MemoryRange) -> &mut [u8] {
+        let start = range.start as usize;
+        let end = range.end as usize;
+        &mut self.as_slice::<u8>()[start..end]
     }
 }
 
@@ -61,35 +53,30 @@ impl MemoryBlock {
     }
 
     pub fn bind_buffer(&self, device: &Device, buf: &Buffer) -> Result<()> {
-        unsafe { device.handle.bind_buffer_memory(buf.handle, self.handle, buf.range.start)?; }
+        unsafe {
+            device.handle.bind_buffer_memory(buf.handle, self.handle, buf.range.start)?;
+        }
         Ok(())
     }
 
-    pub fn map_all(&self, device: &Device) -> Result<MappedMemory> {
-        self.map_range(device, &(0..self.size))
-    }
-
-    pub fn map_range(&self, device: &Device, range: &MemoryRange) -> Result<MappedMemory> {
+    pub fn map(&self, device: &Device) -> Result<MappedMemory> {
         let ptr = unsafe {
             let flags = vk::MemoryMapFlags::empty();
             device
                 .handle
-                .map_memory(self.handle, range.start, range.end, flags)
+                .map_memory(self.handle, 0, self.size, flags)
                 .map(|ptr| ptr as *mut u8)?
         };
         Ok(MappedMemory {
             ptr: ptr as *mut u8,
-            size: range.end - range.start,
+            size: self.size,
         })
     }
 
-    #[allow(dead_code)]
-    pub fn map_buffer(&self, device: &Device, buf: &Buffer) -> Result<MappedMemory> {
-        self.map_range(device, &buf.range)
-    }
-
     pub fn unmap(&self, device: &Device) {
-        unsafe { device.handle.unmap_memory(self.handle); }
+        unsafe {
+            device.handle.unmap_memory(self.handle);
+        }
     }
 
     /// Free the memory and leave `self` in an invalid state.
@@ -105,7 +92,7 @@ impl MemoryBlock {
 #[derive(Clone)]
 pub struct Buffer {
     pub handle: vk::Buffer,
-    range: MemoryRange, 
+    range: MemoryRange,
 }
 
 impl Buffer {
@@ -113,6 +100,11 @@ impl Buffer {
         self.range.end - self.range.start
     }
 
+    /// Destroy and leave `self` in an invalid state.
+    ///
+    /// # Safety
+    ///
+    /// Don't use `self` after calling this function.
     pub unsafe fn destroy(&self, device: &Device) {
         device.handle.destroy_buffer(self.handle, None);
     }
@@ -139,7 +131,7 @@ impl Buffers {
             .iter()
             .map(|info| unsafe {
                 let handle = device.handle.create_buffer(info, None)?;
-                let requirements = device.handle.get_buffer_memory_requirements(handle); 
+                let requirements = device.handle.get_buffer_memory_requirements(handle);
 
                 memory_type_bits &= requirements.memory_type_bits;
 
@@ -150,18 +142,22 @@ impl Buffers {
                 // Round `current_size` up to the next integer which has the alignment of
                 // `alignment`.
                 let start = align_up_to(current_size, alignment);
-                let end = start + requirements.size; 
-                
+                let end = start + requirements.size;
+
                 current_size = end;
-               
-                Ok(Buffer { handle, range: start..end })
+
+                Ok(Buffer {
+                    handle,
+                    range: start..end,
+                })
             })
             .collect();
-        
+
         let buffers = buffers?;
 
-        let memory_type = memory_type_index(&device.memory_properties, memory_flags, memory_type_bits)
-            .ok_or_else(|| anyhow!("no compatible memory type"))?;
+        let memory_type =
+            memory_type_index(&device.memory_properties, memory_flags, memory_type_bits)
+                .ok_or_else(|| anyhow!("no compatible memory type"))?;
 
         let mut alloc_info = vk::MemoryAllocateInfo::builder()
             .allocation_size(current_size)
@@ -169,10 +165,10 @@ impl Buffers {
 
         let mut flags = vk::MemoryAllocateFlagsInfo::builder();
 
-        if create_infos
-            .iter()
-            .any(|info| info.usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS))
-        {
+        if create_infos.iter().any(|info| {
+            info.usage
+                .contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+        }) {
             flags = flags
                 .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS_KHR)
                 .device_mask(1);
@@ -202,10 +198,115 @@ impl Buffers {
     }
 }
 
+#[derive(Clone)]
+pub struct Image {
+    pub handle: vk::Image,
+    pub view: vk::ImageView,
+    pub range: MemoryRange,
+}
+
+impl Image {
+    /// Destroy and leave `self` in an invalid state.
+    ///
+    /// # Safety
+    ///
+    /// Don't use `self` after calling this function.
+    pub unsafe fn destroy(&self, device: &Device) {
+        device.handle.destroy_image(self.handle, None);
+        device.handle.destroy_image_view(self.view, None);
+    }
+}
+
+pub struct Images {
+    pub images: Vec<Image>,
+    pub block: MemoryBlock,
+}
+
+impl Images {
+    pub fn new(
+        device: &Device,
+        image_infos: &[vk::ImageCreateInfo],
+        view_infos: &[vk::ImageViewCreateInfo],
+        memory_flags: vk::MemoryPropertyFlags,
+    ) -> Result<Self> {
+        assert_eq!(
+            image_infos.len(),
+            view_infos.len(),
+            "`image_infos` and `view_infos` are not same length"
+        );
+
+        let mut memory_type_bits = u32::MAX;
+        let mut current_size = 0;
+
+        let images: Result<Vec<_>> = image_infos
+            .iter()
+            .zip(view_infos.iter())
+            .map(|(image_info, view_info)| {
+                assert_eq!(
+                    view_info.format, image_info.format,
+                    "image format and view format not the same"
+                );
+
+                let handle = unsafe { device.handle.create_image(image_info, None)? };
+                let requirements = unsafe { device.handle.get_image_memory_requirements(handle) };
+
+                let start = align_up_to(current_size, requirements.alignment);
+                let end = start + requirements.size;
+
+                memory_type_bits &= requirements.memory_type_bits;
+                current_size = end;
+
+                Ok(Image {
+                    handle,
+                    view: vk::ImageView::null(),
+                    range: start..end,
+                })
+            })
+            .collect();
+
+        let mut images = images?;
+
+        let memory_type =
+            memory_type_index(&device.memory_properties, memory_flags, memory_type_bits)
+                .ok_or_else(|| anyhow!("no compatible memory type"))?;
+
+        let block = {
+            let alloc_info = vk::MemoryAllocateInfo::builder()
+                .allocation_size(current_size)
+                .memory_type_index(memory_type);
+            MemoryBlock::allocate(device, memory_flags, &alloc_info)?
+        };
+
+        for (image, view_info) in images.iter_mut().zip(view_infos.iter()) {
+            image.view = unsafe {
+                device.handle.bind_image_memory(image.handle, block.handle, image.range.start)?;
+
+                let mut info = view_info.clone();
+                info.image = image.handle;
+
+                device.handle.create_image_view(&info, None)?
+            };
+        }
+
+        Ok(Self { images, block })
+    }
+
+    /// Destroy and leave `self` in an invalid state.
+    ///
+    /// # Safety
+    ///
+    /// Don't use `self` after calling this function.
+    #[allow(dead_code)]
+    pub unsafe fn destroy(&self, device: &Device) {
+        self.images.iter().for_each(|image| image.destroy(device));
+        self.block.free(device);
+    }
+}
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct Vertex {
-    position: [f32; 3], 
+    position: [f32; 3],
 }
 
 pub struct Mesh {
@@ -217,21 +318,21 @@ pub struct Mesh {
 
 impl Mesh {
     pub fn from_obj(device: &Device, path: &Path) -> Result<Self> {
-        let data = MeshData::from_obj(path)?;
+        let mesh = MeshData::from_obj(path)?;
 
-        let staging_buffers = {
-            let memory_flags = vk::MemoryPropertyFlags::HOST_VISIBLE
-                | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let stagings = {
+            let memory_flags =
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
             let create_infos = [
                 vk::BufferCreateInfo::builder()
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                    .size(data.vertex_size as u64)
+                    .size(mesh.vertex_size as u64)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .build(),
                 vk::BufferCreateInfo::builder()
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                    .size(data.index_size as u64)
+                    .size(mesh.index_size as u64)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .build(),
             ];
@@ -240,22 +341,28 @@ impl Mesh {
         };
 
         unsafe {
-            staging_buffers.block.map_all(device)?.fill(&data.data)?;
-            staging_buffers.block.unmap(device);
+            let mapped = stagings.block.map(device)?;
+            mapped
+                .get_range(&stagings.buffers[0].range)
+                .copy_from_slice(&mesh.data[0..mesh.vertex_size]);
+            mapped
+                .get_range(&stagings.buffers[1].range)
+                .copy_from_slice(&mesh.data[mesh.vertex_size..]);
+            stagings.block.unmap(device);
         }
-        
+
         let buffers = {
             let memory_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
 
             let create_infos = [
                 vk::BufferCreateInfo::builder()
                     .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-                    .size(data.vertex_size as u64)
+                    .size(mesh.vertex_size as u64)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .build(),
                 vk::BufferCreateInfo::builder()
                     .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-                    .size(data.index_size as u64)
+                    .size(mesh.index_size as u64)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .build(),
             ];
@@ -264,7 +371,7 @@ impl Mesh {
         };
 
         device.transfer(|command_buffer| {
-            for (src, dst) in staging_buffers.buffers.iter().zip(buffers.buffers.iter()) {
+            for (src, dst) in stagings.buffers.iter().zip(buffers.buffers.iter()) {
                 assert_eq!(src.size(), dst.size());
 
                 let regions = [vk::BufferCopy::builder()
@@ -274,16 +381,18 @@ impl Mesh {
                     .build()];
 
                 unsafe {
-                    device.handle.cmd_copy_buffer(command_buffer, src.handle, dst.handle, &regions);
+                    device
+                        .handle
+                        .cmd_copy_buffer(command_buffer, src.handle, dst.handle, &regions);
                 }
             }
         })?;
 
         unsafe {
-            staging_buffers.destroy(device);
+            stagings.destroy(device);
         }
 
-        let index_count = (data.index_size / std::mem::size_of::<u32>()) as u32;
+        let index_count = (mesh.index_size / std::mem::size_of::<u32>()) as u32;
 
         let vertex_buffer = buffers.buffers[0].clone();
         let index_buffer = buffers.buffers[1].clone();
@@ -306,7 +415,6 @@ impl Mesh {
         self.index_buffer.destroy(device);
         self.block.free(device);
     }
-
 }
 
 struct MeshData {
@@ -320,7 +428,7 @@ impl MeshData {
         let load_options = tobj::LoadOptions {
             single_index: true,
             ignore_lines: true,
-            ignore_points: true, 
+            ignore_points: true,
             triangulate: false,
         };
 
@@ -380,7 +488,7 @@ fn gcm_pow2(mut a: u64, mut b: u64) -> u64 {
         b = a & (b - 1);
         a = t;
     }
-    
+
     a
 }
 
