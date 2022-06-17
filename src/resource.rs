@@ -89,7 +89,7 @@ impl MemoryBlock {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Buffer {
     pub handle: vk::Buffer,
     range: MemoryRange,
@@ -122,8 +122,6 @@ impl Buffers {
         memory_flags: vk::MemoryPropertyFlags,
         alignment: vk::DeviceSize,
     ) -> Result<Buffers> {
-        println!("alignment: {}", alignment);
-
         let mut memory_type_bits = u32::MAX;
         let mut current_size = 0;
 
@@ -142,9 +140,9 @@ impl Buffers {
                 // Round `current_size` up to the next integer which has the alignment of
                 // `alignment`.
                 let start = align_up_to(current_size, alignment);
-                let end = start + requirements.size;
+                let end = start + info.size;
 
-                current_size = end;
+                current_size = start + requirements.size;
 
                 Ok(Buffer {
                     handle,
@@ -165,10 +163,9 @@ impl Buffers {
 
         let mut flags = vk::MemoryAllocateFlagsInfo::builder();
 
-        if create_infos.iter().any(|info| {
-            info.usage
-                .contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
-        }) {
+        if create_infos.iter().any(|info|
+            info.usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+        ) {
             flags = flags
                 .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS_KHR)
                 .device_mask(1);
@@ -327,12 +324,12 @@ impl Mesh {
             let create_infos = [
                 vk::BufferCreateInfo::builder()
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                    .size(mesh.vertex_size as u64)
+                    .size(mesh.verts.len() as u64)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .build(),
                 vk::BufferCreateInfo::builder()
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                    .size(mesh.index_size as u64)
+                    .size(mesh.indices.len() as u64)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .build(),
             ];
@@ -342,12 +339,10 @@ impl Mesh {
 
         unsafe {
             let mapped = stagings.block.map(device)?;
-            mapped
-                .get_range(&stagings.buffers[0].range)
-                .copy_from_slice(&mesh.data[0..mesh.vertex_size]);
-            mapped
-                .get_range(&stagings.buffers[1].range)
-                .copy_from_slice(&mesh.data[mesh.vertex_size..]);
+
+            mapped.get_range(&stagings.buffers[0].range).copy_from_slice(&mesh.verts);
+            mapped.get_range(&stagings.buffers[1].range).copy_from_slice(&mesh.indices);
+
             stagings.block.unmap(device);
         }
 
@@ -357,12 +352,12 @@ impl Mesh {
             let create_infos = [
                 vk::BufferCreateInfo::builder()
                     .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-                    .size(mesh.vertex_size as u64)
+                    .size(mesh.verts.len() as u64)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .build(),
                 vk::BufferCreateInfo::builder()
                     .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-                    .size(mesh.index_size as u64)
+                    .size(mesh.indices.len() as u64)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .build(),
             ];
@@ -392,7 +387,7 @@ impl Mesh {
             stagings.destroy(device);
         }
 
-        let index_count = (mesh.index_size / std::mem::size_of::<u32>()) as u32;
+        let index_count = (mesh.indices.len() / std::mem::size_of::<u32>()) as u32;
 
         let vertex_buffer = buffers.buffers[0].clone();
         let index_buffer = buffers.buffers[1].clone();
@@ -418,15 +413,15 @@ impl Mesh {
 }
 
 struct MeshData {
-    data: Vec<u8>,
-    vertex_size: usize,
-    index_size: usize,
+    verts: Vec<u8>,
+    indices: Vec<u8>,
 }
 
 impl MeshData {
     fn from_obj(path: &Path) -> Result<Self> {
         let load_options = tobj::LoadOptions {
-            single_index: true,
+            merge_identical_points: false,
+            single_index: false,
             ignore_lines: true,
             ignore_points: true,
             triangulate: false,
@@ -434,29 +429,20 @@ impl MeshData {
 
         let (models, _) = tobj::load_obj(path, &load_options)?;
 
-        let mut verts: Vec<_> = models
+        let verts: Vec<_> = models
             .iter()
             .take(1)
             .flat_map(|model| model.mesh.positions.as_slice())
             .flat_map(|pos| pos.to_le_bytes())
             .collect();
-        let mut indices: Vec<_> = models
+        let indices: Vec<_> = models
             .iter()
             .take(1)
             .flat_map(|model| model.mesh.indices.as_slice())
             .flat_map(|index| index.to_le_bytes())
             .collect();
 
-        let vertex_size = verts.len();
-        let index_size = indices.len();
-
-        verts.append(&mut indices);
-
-        Ok(Self {
-            data: verts,
-            vertex_size,
-            index_size,
-        })
+        Ok(Self { verts, indices })
     }
 }
 

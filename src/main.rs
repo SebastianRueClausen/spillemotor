@@ -74,6 +74,8 @@ fn main() -> Result<()> {
             }
         }
         Event::RedrawRequested(_) => {
+            trace!("frame time: {} ms", last_draw.elapsed().as_millis());
+
             last_draw = Instant::now();
 
             if !minimized && !renderer.draw().expect("failed drawing to the screen") {

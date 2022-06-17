@@ -40,10 +40,15 @@ impl Renderer {
         let uniform_buffers = UniformBuffers::new(&device)?;
         let uniform_data = UniformData::default();
 
-        let render_pipeline =
-            Pipeline::new_render(&device, &swapchain, &render_pass, &uniform_buffers)?;
+        let render_pipeline = Pipeline::new_render(
+            &device,
+            &swapchain,
+            &render_pass,
+            &render_targets,
+            &uniform_buffers,
+        )?;
 
-        let mesh = Mesh::from_obj(&device, Path::new("models/lowcat/cat.obj"))?;
+        let mesh = Mesh::from_obj(&device, Path::new("models/dragon/dragon.obj"))?;
 
         let aspect_ratio = window_extent.width as f32 / window_extent.height as f32;
         let camera = Camera::new(aspect_ratio);
@@ -114,6 +119,11 @@ impl Renderer {
 
                     let clear_values = [
                         vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [0.02, 0.02, 0.02, 1.0],
+                            },
+                        },
+                        vk::ClearValue {
                             depth_stencil: vk::ClearDepthStencilValue {
                                 depth: 1.0,
                                 stencil: 0,
@@ -121,7 +131,7 @@ impl Renderer {
                         },
                         vk::ClearValue {
                             color: vk::ClearColorValue {
-                                float32: [0.02, 0.02, 0.02, 1.0],
+                                float32: [0.00, 0.00, 0.00, 1.0],
                             },
                         },
                     ];
@@ -184,10 +194,10 @@ impl Renderer {
                     );
 
                     self.device.handle.cmd_end_render_pass(frame.command_buffer);
-                    self.device
-                        .handle
-                        .end_command_buffer(frame.command_buffer)?;
+                    self.device.handle.end_command_buffer(frame.command_buffer)?;
                 }
+
+                let before = std::time::Instant::now();
 
                 // Submit command buffer to be rendered. Wait for semaphore `sync.presented` first and
                 // signals `sync.rendered´ and `sync.ready_to_draw` when all commands have been
@@ -228,6 +238,8 @@ impl Renderer {
                         .queue_present(self.device.transfer_queue.handle, &present_info)
                         .unwrap();
 
+                    trace!("spend: {}", before.elapsed().as_millis());
+
                     Ok(true)
                 }
             }
@@ -262,6 +274,7 @@ impl Renderer {
             &self.device,
             &self.swapchain,
             &self.render_pass,
+            &self.render_targets,
             &self.uniform_buffers,
         )?;
 
@@ -341,7 +354,7 @@ impl Device {
         };
 
         let validation_layer = CString::new("VK_LAYER_KHRONOS_validation").unwrap();
-        let layer_names = [validation_layer.as_ptr()];
+        let layer_names = [ validation_layer.as_ptr() ];
 
         let version = vk::make_api_version(0, 1, 0, 0);
 
@@ -376,13 +389,29 @@ impl Device {
         let messenger = DebugMessenger::new(&entry, &instance, &debug_info)?;
 
         let physical = unsafe {
+            // HACK HACK HACK
+            let mut i = 0;
+
             instance
                 .enumerate_physical_devices()?
                 .into_iter()
                 .max_by_key(|dev| {
                     let properties = instance.get_physical_device_properties(*dev);
 
+                    let name = CStr::from_ptr(properties.device_name.as_ptr())
+                        .to_str()
+                        .unwrap_or("invalid")
+                        .to_string();
+
+                    trace!("device candicate {name}");
+
                     let mut score = 0;
+
+                    if i == 0 {
+                        score += 100000;
+                    }
+
+                    i += 1;
 
                     if properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
                         score += 1000;
@@ -537,6 +566,25 @@ impl Device {
         Ok(())
     }
 
+    fn sample_count(&self) -> vk::SampleCountFlags {
+        let counts = self.device_properties.limits.framebuffer_depth_sample_counts;
+
+        // We don't wan't more than 8.
+        let types = [
+            vk::SampleCountFlags::TYPE_8,
+            vk::SampleCountFlags::TYPE_4,
+            vk::SampleCountFlags::TYPE_2,
+        ];
+        
+        for t in types {
+            if counts.contains(t) {
+                return t;
+            }
+        }
+
+        return vk::SampleCountFlags::TYPE_1;
+    }
+
     /// Destroy and leave `self` in an invalid state.
     ///
     /// # Safety
@@ -588,6 +636,17 @@ pub struct RenderPass {
 impl RenderPass {
     fn new(device: &Device, swapchain: &Swapchain, render_targets: &RenderTargets) -> Result<Self> {
         let attachments = [
+            // Swapchain image.
+            vk::AttachmentDescription::builder()
+                .format(swapchain.surface_format.format)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .samples(render_targets.sample_count)
+                .build(),
             // Depth image.
             vk::AttachmentDescription::builder()
                 .format(DEPTH_IMAGE_FORMAT)
@@ -597,12 +656,12 @@ impl RenderPass {
                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                 .initial_layout(vk::ImageLayout::UNDEFINED)
                 .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-                .samples(vk::SampleCountFlags::TYPE_1)
+                .samples(render_targets.sample_count)
                 .build(),
-            // Swapchain image.
+            // Msaa image.
             vk::AttachmentDescription::builder()
                 .format(swapchain.surface_format.format)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -612,18 +671,24 @@ impl RenderPass {
                 .build(),
         ];
 
-        let depth_attachment = vk::AttachmentReference {
+        let color_attachments = [vk::AttachmentReference {
             attachment: 0,
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        }];
+
+        let depth_attachment = vk::AttachmentReference {
+            attachment: 1,
             layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         };
 
-        let color_attachments = [vk::AttachmentReference {
-            attachment: 1,
+        let msaa_attachments = [vk::AttachmentReference {
+            attachment: 2,
             layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         }];
 
         let subpasses = [vk::SubpassDescription::builder()
             .depth_stencil_attachment(&depth_attachment)
+            .resolve_attachments(&msaa_attachments)
             .color_attachments(&color_attachments)
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .build()];
@@ -631,11 +696,10 @@ impl RenderPass {
         let subpass_dependencies = [vk::SubpassDependency::builder()
             .src_subpass(vk::SUBPASS_EXTERNAL)
             .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::empty())
             .dst_subpass(0)
             .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(
-                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            )
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .build()];
 
         let handle = unsafe {
@@ -652,7 +716,11 @@ impl RenderPass {
             .iter()
             .zip(render_targets.targets.iter())
             .map(|(swapchain_image, render_targets)| {
-                let views = [render_targets.depth.view, swapchain_image.view];
+                let views = [
+                    render_targets.msaa.view,
+                    render_targets.depth.view,
+                    swapchain_image.view,
+                ];
                 let info = vk::FramebufferCreateInfo::builder()
                     .render_pass(handle)
                     .attachments(&views)
@@ -873,16 +941,27 @@ impl SwapchainImage {
 // TODO: Add MSAA here as well.
 struct RenderTarget {
     depth: Image,
+    msaa: Image,
 }
 
 struct RenderTargets {
     targets: Vec<RenderTarget>,
     block: MemoryBlock,
+    sample_count: vk::SampleCountFlags,
 }
 
 impl RenderTargets {
     fn new(device: &Device, swapchain: &Swapchain) -> Result<Self> {
         let queue_families = [device.graphics_queue.family_index];
+
+        let extent = vk::Extent3D {
+            width: swapchain.extent.width,
+            height: swapchain.extent.height,
+            depth: 1,
+        };
+
+        let sample_count = device.sample_count();
+
         let depth_image_info = vk::ImageCreateInfo::builder()
             .image_type(vk::ImageType::TYPE_2D)
             .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
@@ -890,14 +969,10 @@ impl RenderTargets {
             .tiling(vk::ImageTiling::OPTIMAL)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .queue_family_indices(&queue_families)
-            .extent(vk::Extent3D {
-                width: swapchain.extent.width,
-                height: swapchain.extent.height,
-                depth: 1,
-            })
+            .extent(extent)
             .mip_levels(1)
             .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1);
+            .samples(sample_count);
         let depth_subresource_info = vk::ImageSubresourceRange::builder()
             .aspect_mask(vk::ImageAspectFlags::DEPTH)
             .base_mip_level(0)
@@ -909,8 +984,41 @@ impl RenderTargets {
             .format(DEPTH_IMAGE_FORMAT)
             .subresource_range(*depth_subresource_info);
 
-        let image_infos = vec![depth_image_info.build(); swapchain.image_count() as usize];
-        let view_infos = vec![depth_view_info.build(); swapchain.image_count() as usize];
+        let msaa_image_info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .usage(vk::ImageUsageFlags::TRANSIENT_ATTACHMENT
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .format(swapchain.surface_format.format)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .queue_family_indices(&queue_families)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(sample_count);
+        let msaa_subresource_info = vk::ImageSubresourceRange::builder()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let msaa_view_info = vk::ImageViewCreateInfo::builder()
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(swapchain.surface_format.format)
+            .subresource_range(*msaa_subresource_info);
+
+        let image_infos: Vec<vk::ImageCreateInfo> = [depth_image_info.build(), msaa_image_info.build()]
+            .iter()
+            .cycle()
+            .map(|info| *info)
+            .take(swapchain.image_count() as usize * 2)
+            .collect();
+        let view_infos: Vec<_> = [depth_view_info.build(), msaa_view_info.build()]
+            .iter()
+            .cycle()
+            .map(|info| *info)
+            .take(swapchain.image_count() as usize * 2)
+            .collect();
 
         let images = Images::new(
             device,
@@ -921,15 +1029,18 @@ impl RenderTargets {
 
         let targets = images
             .images
-            .iter()
-            .map(|depth| RenderTarget {
-                depth: depth.clone(),
+            .as_slice()
+            .chunks(2)
+            .map(|images| RenderTarget {
+                depth: images[0].clone(),
+                msaa: images[1].clone(),
             })
             .collect();
 
         Ok(Self {
             targets,
             block: images.block,
+            sample_count,
         })
     }
 
@@ -941,7 +1052,10 @@ impl RenderTargets {
     unsafe fn destroy(&self, device: &Device) {
         self.targets
             .iter()
-            .for_each(|target| target.depth.destroy(device));
+            .for_each(|target| {
+                target.depth.destroy(device);
+                target.msaa.destroy(device);
+            });
         self.block.free(device);
     }
 }
@@ -1218,10 +1332,11 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn new_render(
+    fn new_render(
         device: &Device,
         swapchain: &Swapchain,
         render_pass: &RenderPass,
+        render_targets: &RenderTargets,
         uniform_buffers: &UniformBuffers,
     ) -> Result<Self> {
         let vertex_module = create_shader_module(
@@ -1345,12 +1460,12 @@ impl Pipeline {
 
         let rasterize_info = vk::PipelineRasterizationStateCreateInfo::builder()
             .line_width(1.0)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .front_face(vk::FrontFace::CLOCKWISE)
             .cull_mode(vk::CullModeFlags::BACK)
             .polygon_mode(vk::PolygonMode::FILL);
 
         let multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            .rasterization_samples(render_targets.sample_count);
 
         let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::builder()
             .blend_enable(true)
