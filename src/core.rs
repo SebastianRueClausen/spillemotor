@@ -136,7 +136,11 @@ impl Renderer {
                         },
                     ];
 
-                    let framebuffer = self.render_pass.framebuffers[image_index as usize];
+                    let framebuffer = self.render_pass.get_framebuffer(
+                        &self.swapchain,
+                        self.frame_queue.frame_index,
+                        image_index,
+                    );
 
                     let render_pass_begin_info = vk::RenderPassBeginInfo::builder()
                         .render_pass(self.render_pass.handle)
@@ -197,8 +201,6 @@ impl Renderer {
                     self.device.handle.end_command_buffer(frame.command_buffer)?;
                 }
 
-                let before = std::time::Instant::now();
-
                 // Submit command buffer to be rendered. Wait for semaphore `sync.presented` first and
                 // signals `sync.rendered´ and `sync.ready_to_draw` when all commands have been
                 // executed.
@@ -238,8 +240,6 @@ impl Renderer {
                         .queue_present(self.device.transfer_queue.handle, &present_info)
                         .unwrap();
 
-                    trace!("spend: {}", before.elapsed().as_millis());
-
                     Ok(true)
                 }
             }
@@ -249,7 +249,7 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, window: &winit::window::Window) -> Result<()> {
-        trace!("resizeing");
+        trace!("resizing");
 
         unsafe {
             self.device
@@ -309,10 +309,12 @@ impl Drop for Renderer {
 /// after creation and doesn't depend on external factors such as display size.
 pub struct Device {
     /// Name of `physical`, for instance "GTX 770".
+    #[allow(dead_code)]
     name: String,
 
     pub handle: ash::Device,
 
+    #[allow(dead_code)]
     entry: ash::Entry,
     instance: ash::Instance,
     physical: vk::PhysicalDevice,
@@ -385,7 +387,6 @@ impl Device {
         };
 
         let surface = Surface::new(&instance, &entry, &window)?;
-
         let messenger = DebugMessenger::new(&entry, &instance, &debug_info)?;
 
         let physical = unsafe {
@@ -559,8 +560,7 @@ impl Device {
             )?;
 
             self.handle.queue_wait_idle(self.transfer_queue.handle)?;
-            self.handle
-                .free_command_buffers(self.transfer_pool, &buffers);
+            self.handle.free_command_buffers(self.transfer_pool, &buffers);
         }
 
         Ok(())
@@ -629,7 +629,40 @@ impl DebugMessenger {
 
 pub struct RenderPass {
     handle: vk::RenderPass,
-    /// Should always match the swapchain image count.
+    /// We choose the amount of framebuffers to be the swapchain image count times `FRAMES_IN_FLIGHT`.
+    ///
+    /// This is to avoid allocating attachments for each swapchain image. Instead we have a
+    /// framebuffer for each combination of frame resources and swapchain image, and can therefore
+    /// have a render attachment for each frame in flight instead. It's essentially a mapping from
+    /// swapchain image index and frame index to framebuffer.
+    ///
+    /// Alternatively you could either have a render attachments for each swapchain image, or
+    /// create a new framebuffer dynamically before each frame. They both have disadvanges however.
+    /// 
+    /// Some graphics cards gives up to 5 swapchain images it seems, so having 5 depth images and
+    /// msaa images is be somewhat wasteful considering we only use `FRAMES_IN_FLIGHT` at a time.
+    ///
+    /// Creating new a new framebuffer each frame doesn't seem to be expensive as such, but it's
+    /// still seems like an unnecessary cost to pay.
+    ///
+    /// # Example 1
+    ///
+    /// Let's say the system gives 4 swapchain images and we have 2 images in flight, the
+    /// framebuffers looks as follows.
+    ///
+    /// | Framebuffer | Frame | Image |
+    /// |-------------|-------|-------|
+    /// | 0           | 0     | 0     |
+    /// | 1           | 0     | 1     |
+    /// | 2           | 0     | 2     |
+    /// | 3           | 0     | 3     |
+    /// | 4           | 1     | 0     |
+    /// | 5           | 1     | 1     |
+    /// | 6           | 1     | 2     |
+    /// | 7           | 1     | 3     |
+    ///
+    /// As you can see there is a framebuffer for each combination of frame and image.
+    ///
     framebuffers: Vec<vk::Framebuffer>,
 }
 
@@ -711,11 +744,14 @@ impl RenderPass {
             device.handle.create_render_pass(&info, None)?
         };
 
-        let framebuffers: Result<Vec<_>> = swapchain
-            .images
+        let framebuffers: Result<Vec<_>> = render_targets
+            .targets
             .iter()
-            .zip(render_targets.targets.iter())
-            .map(|(swapchain_image, render_targets)| {
+            .flat_map(|t| {
+                std::iter::repeat(t).take(swapchain.image_count() as usize)
+            })
+            .zip(swapchain.images.iter().cycle())
+            .map(|(render_targets, swapchain_image)| {
                 let views = [
                     render_targets.msaa.view,
                     render_targets.depth.view,
@@ -736,6 +772,19 @@ impl RenderPass {
             framebuffers: framebuffers?,
             handle,
         })
+    }
+
+    /// Get the framebuffer mapped to `image_index` and `frame_index`.
+    ///
+    /// See [`RenderPass::framebuffers`] for details.
+    fn get_framebuffer(
+        &self,
+        swapchain: &Swapchain,
+        frame_index: usize,
+        image_index: u32,
+    ) -> vk::Framebuffer {
+        let index = frame_index as u32 * swapchain.image_count() + image_index;
+        self.framebuffers[index as usize]
     }
 
     /// Destroy and leave `self` in an invalid state.
@@ -938,7 +987,6 @@ impl SwapchainImage {
     }
 }
 
-// TODO: Add MSAA here as well.
 struct RenderTarget {
     depth: Image,
     msaa: Image,
@@ -1011,13 +1059,13 @@ impl RenderTargets {
             .iter()
             .cycle()
             .map(|info| *info)
-            .take(swapchain.image_count() as usize * 2)
+            .take(FRAMES_IN_FLIGHT * 2)
             .collect();
         let view_infos: Vec<_> = [depth_view_info.build(), msaa_view_info.build()]
             .iter()
             .cycle()
             .map(|info| *info)
-            .take(swapchain.image_count() as usize * 2)
+            .take(FRAMES_IN_FLIGHT * 2)
             .collect();
 
         let images = Images::new(
@@ -1075,7 +1123,7 @@ impl Swapchain {
     /// Create a new swapchain. `extent` is used to determine the size of the swapchain images only
     /// if it aren't able to determine it from `surface`.
     pub fn new(device: &Device, extent: vk::Extent2D) -> Result<Self> {
-        let (surface_formats, present_modes, surface_caps) = unsafe {
+        let (surface_formats, _present_modes, surface_caps) = unsafe {
             let format = device
                 .surface
                 .loader
@@ -1097,11 +1145,6 @@ impl Swapchain {
 
         let queue_families = [device.graphics_queue.family_index];
         let min_image_count = 2.max(surface_caps.min_image_count);
-
-        println!(
-            "min: {}, max: {}",
-            surface_caps.min_image_count, surface_caps.max_image_count
-        );
 
         let surface_format = surface_formats
             .iter()
@@ -1128,7 +1171,7 @@ impl Swapchain {
             }
         };
 
-        let present_mode = present_modes
+        let present_mode = _present_modes
             .iter()
             .any(|mode| *mode == vk::PresentModeKHR::MAILBOX)
             .then(|| vk::PresentModeKHR::MAILBOX)
@@ -1188,7 +1231,7 @@ impl Swapchain {
         };
 
         let queue_families = [device.graphics_queue.family_index];
-        let min_image_count = 2.max(surface_caps.min_image_count);
+        let min_image_count = (FRAMES_IN_FLIGHT as u32).max(surface_caps.min_image_count);
 
         let swapchain_info = vk::SwapchainCreateInfoKHR::builder()
             .old_swapchain(self.handle)

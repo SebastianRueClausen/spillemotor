@@ -5,6 +5,7 @@ use std::ops::Range;
 use std::path::Path;
 
 use crate::core::Device;
+use crate::util;
 
 type MemoryRange = Range<vk::DeviceSize>;
 
@@ -135,11 +136,11 @@ impl Buffers {
 
                 // Find an aligment that fits both that of `alignemnt` and the alignment required
                 // by the buffer.
-                let alignment = lcm_pow2(alignment, requirements.alignment);
+                let alignment = util::lcm(alignment, requirements.alignment);
 
                 // Round `current_size` up to the next integer which has the alignment of
                 // `alignment`.
-                let start = align_up_to(current_size, alignment);
+                let start = util::align_up_to(current_size, alignment);
                 let end = start + info.size;
 
                 current_size = start + requirements.size;
@@ -247,7 +248,7 @@ impl Images {
                 let handle = unsafe { device.handle.create_image(image_info, None)? };
                 let requirements = unsafe { device.handle.get_image_memory_requirements(handle) };
 
-                let start = align_up_to(current_size, requirements.alignment);
+                let start = util::align_up_to(current_size, requirements.alignment);
                 let end = start + requirements.size;
 
                 memory_type_bits &= requirements.memory_type_bits;
@@ -460,30 +461,4 @@ fn memory_type_index(
             memory_type_bits & (1 << i) != 0 && (memory_type.property_flags & flags) == flags
         })
         .map(|index| index as u32)
-}
-
-/// Calculate greatest common multiple for two powers of 2. Used to calculate alignment, which is
-/// all powers of 2.
-#[inline]
-fn gcm_pow2(mut a: u64, mut b: u64) -> u64 {
-    debug_assert_eq!(a % 2, 0);
-    debug_assert_eq!(b % 2, 0);
-
-    while b != 0 {
-        let t = b;
-        b = a & (b - 1);
-        a = t;
-    }
-
-    a
-}
-
-#[inline]
-fn lcm_pow2(a: u64, b: u64) -> u64 {
-    a * (b / gcm_pow2(a, b))
-}
-
-#[inline]
-fn align_up_to(a: u64, alignment: u64) -> u64 {
-    ((a + alignment - 1) / alignment) * alignment
 }

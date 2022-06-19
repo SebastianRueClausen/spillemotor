@@ -10,6 +10,7 @@ mod macros;
 mod camera;
 mod resource;
 mod core;
+mod util;
 
 use anyhow::Result;
 
