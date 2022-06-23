@@ -361,8 +361,8 @@ impl Device {
         let version = vk::make_api_version(0, 1, 0, 0);
 
         let instance = unsafe {
-            let engine_name = CString::new("tobak").unwrap();
-            let app_name = CString::new("tobak").unwrap();
+            let engine_name = CString::new("spillemotor").unwrap();
+            let app_name = CString::new("spillemotor").unwrap();
 
             let app_info = vk::ApplicationInfo::builder()
                 .application_name(&app_name)
@@ -374,10 +374,28 @@ impl Device {
             let ext_names = [
                 ext::DebugUtils::name().as_ptr(),
                 khr::Surface::name().as_ptr(),
+
+                #[cfg(target_os = "linux")]
                 khr::WaylandSurface::name().as_ptr(),
+
+                #[cfg(target_os = "macos")]
+                ext::MetalSurface::name().as_ptr(),
+
+                #[cfg(target_os = "macos")]
+                vk::KhrPortabilityEnumerationFn::name().as_ptr(),
+
+                #[cfg(target_os = "macos")]
+                vk::KhrGetPhysicalDeviceProperties2Fn::name().as_ptr()
             ];
 
+            let flags = if cfg!(target_os = "macos") {
+                vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
+            } else {
+                vk::InstanceCreateFlags::default()
+            };
+
             let info = vk::InstanceCreateInfo::builder()
+                .flags(flags)
                 .push_next(&mut debug_info)
                 .application_info(&app_info)
                 .enabled_layer_names(&layer_names)
@@ -390,9 +408,6 @@ impl Device {
         let messenger = DebugMessenger::new(&entry, &instance, &debug_info)?;
 
         let physical = unsafe {
-            // HACK HACK HACK
-            let mut i = 0;
-
             instance
                 .enumerate_physical_devices()?
                 .into_iter()
@@ -407,12 +422,6 @@ impl Device {
                     trace!("device candicate {name}");
 
                     let mut score = 0;
-
-                    if i == 0 {
-                        score += 100000;
-                    }
-
-                    i += 1;
 
                     if properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
                         score += 1000;
@@ -473,7 +482,12 @@ impl Device {
                 .build(),
         ];
 
-        let extensions = [khr::Swapchain::name().as_ptr()];
+        let extensions = [
+            khr::Swapchain::name().as_ptr(),
+
+            #[cfg(target_os = "macos")]
+            vk::KhrPortabilitySubsetFn::name().as_ptr(),
+        ];
 
         // Only create queues for both transfer and graphics if they aren't the same queue.
         let device_info = if transfer_index != graphics_index {
@@ -912,7 +926,6 @@ impl FrameQueue {
 
 /// TODO: Make this handle more display servers besides Wayland.
 struct Surface {
-    _wayland: khr::WaylandSurface,
     handle: vk::SurfaceKHR,
     loader: khr::Surface,
 }
@@ -923,27 +936,63 @@ impl Surface {
         entry: &ash::Entry,
         window: &winit::window::Window,
     ) -> Result<Self> {
-        use winit::platform::unix::WindowExtUnix;
-
-        let wayland_display = window
-            .wayland_display()
-            .ok_or_else(|| anyhow!("not able to fetch wayland display"))?;
-
-        let wayland_surface = window
-            .wayland_surface()
-            .ok_or_else(|| anyhow!("not able to fetch wayland window"))?;
-
-        let create_info = vk::WaylandSurfaceCreateInfoKHR::builder()
-            .display(wayland_display)
-            .surface(wayland_surface);
-
-        let wayland = khr::WaylandSurface::new(&entry, &instance);
         let loader = khr::Surface::new(&entry, &instance);
 
-        let handle = unsafe { wayland.create_wayland_surface(&create_info, None)? };
+        use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+        let handle = match window.raw_window_handle() {
+            #[cfg(target_os = "linux")]
+            RawWindowHandle::Wayland(handle) => {
+                let info = vk::WaylandSurfaceCreateInfoKHR::builder()
+                    .display(handle.display)
+                    .surface(handle.surface);
+                let loader = khr::WaylandSurface::new(entry, instance);
+                loader.create_wayland_surface(&info, None)
+            }
+
+            #[cfg(target_os = "linux")]
+            RawWindowHandle::Xlib(handle) => {
+                let info = vk::XlibSurfaceCreateInfoKHR::builder()
+                    .dpy(handle.display as *mut _)
+                    .window(handle.window);
+                let loader = khr::XlibSurface::new(entry, instance);
+                loader.create_xlib_surface(&info, None)
+            }
+
+            #[cfg(target_os = "linux")]
+            RawWindowHandle::Xcb(handle) => {
+                let info = vk::XcbSurfaceCreateInfoKHR::builder()
+                    .connection(handle.connection)
+                    .window(handle.window);
+                let loader = khr::XcbSurface::new(entry, instance);
+                loader.create_xcb_surface(&info, None)
+            }
+
+            #[cfg(target_os = "macos")]
+            RawWindowHandle::AppKit(handle) => unsafe {
+                use raw_window_metal::{appkit, Layer};
+
+                let layer = appkit::metal_layer_from_handle(handle);
+                let layer = match layer {
+                    Layer::Existing(layer) | Layer::Allocated(layer) => layer as *mut _,
+                    Layer::None => {
+                        return Err(anyhow!("failed to load metal layer"));
+                    }
+                };
+
+                let info = vk::MetalSurfaceCreateInfoEXT::builder().layer(&*layer);
+                let loader = ext::MetalSurface::new(entry, instance);
+
+                loader.create_metal_surface(&info, None)
+            }
+
+            _ => {
+                return Err(anyhow!("unsupported platform"));
+            }
+        };
+
+        let handle = handle?;
 
         Ok(Self {
-            _wayland: wayland,
             handle,
             loader,
         })
