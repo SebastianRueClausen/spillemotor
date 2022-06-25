@@ -81,7 +81,7 @@ impl Camera {
         let pitch = 0.0;
 
         let fov = 66.0_f32;
-        let znear = 1.0;
+        let znear = 0.01;
         let zfar = 1000.0;
 
         let view = Mat4::look_at_rh(position, position, up);
@@ -94,7 +94,7 @@ impl Camera {
 
         Self {
             rotation_speed: 0.5,
-            movement_speed: 60.0,
+            movement_speed: 15.0,
             position,
             up,
             front,

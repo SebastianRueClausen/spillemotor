@@ -1,3 +1,5 @@
+#![feature(let_else)]
+
 #[macro_use]
 extern crate log;
 
@@ -11,6 +13,7 @@ mod camera;
 mod resource;
 mod core;
 mod util;
+mod scene;
 
 use anyhow::Result;
 

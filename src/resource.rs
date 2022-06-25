@@ -1,8 +1,7 @@
 use anyhow::Result;
 use ash::vk;
 
-use std::ops::Range;
-use std::path::Path;
+use std::ops::{Index, Range};
 
 use crate::core::Device;
 use crate::util;
@@ -16,7 +15,10 @@ pub struct MappedMemory {
 
 impl MappedMemory {
     pub unsafe fn as_slice<T: Sized>(&self) -> &mut [T] {
-        std::slice::from_raw_parts_mut(self.as_ptr(), self.size as usize / std::mem::size_of::<T>())
+        std::slice::from_raw_parts_mut(
+            self.as_ptr(),
+            self.size as usize / std::mem::size_of::<T>(),
+        )
     }
 
     pub unsafe fn as_ptr<T: Sized>(&self) -> *mut T {
@@ -93,7 +95,7 @@ impl MemoryBlock {
 #[derive(Debug, Clone)]
 pub struct Buffer {
     pub handle: vk::Buffer,
-    range: MemoryRange,
+    pub range: MemoryRange,
 }
 
 impl Buffer {
@@ -114,6 +116,14 @@ impl Buffer {
 pub struct Buffers {
     pub block: MemoryBlock,
     pub buffers: Vec<Buffer>,
+}
+
+impl Index<usize> for Buffers {
+    type Output = Buffer;
+
+    fn index(&self, idx: usize) -> &Self::Output {
+        &self.buffers[idx]
+    }
 }
 
 impl Buffers {
@@ -200,10 +210,74 @@ impl Buffers {
 pub struct Image {
     pub handle: vk::Image,
     pub view: vk::ImageView,
+    pub layout: vk::ImageLayout,
+    pub format: vk::Format,
+    pub extent: vk::Extent3D,
     pub range: MemoryRange,
 }
 
 impl Image {
+    pub fn size(&self) -> vk::DeviceSize {
+        self.range.end - self.range.start
+    }
+
+    pub fn transition_layout(&mut self, device: &Device, new: vk::ImageLayout) -> Result<()> {
+        assert_ne!(new, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        device.transfer(|cmd| {
+            let subresource = vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build();
+            let mut barrier = vk::ImageMemoryBarrier::builder()
+                .image(self.handle)
+                .old_layout(self.layout)
+                .new_layout(new)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(subresource);
+       
+            let (src_stage, dst_stage) = match (self.layout, new) {
+                (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => {
+                    barrier = barrier
+                        .src_access_mask(vk::AccessFlags::empty())
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                    (vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER)
+                }
+                (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => {
+                    barrier = barrier
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                    (vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER)
+                }
+                _ => {
+                    todo!()  
+                },
+            };
+
+            self.layout = new;
+   
+            let barriers = [barrier.build()];
+
+            unsafe {
+                device.handle.cmd_pipeline_barrier(
+                    cmd,
+                    src_stage,
+                    dst_stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barriers,
+                );
+            }
+        })?;
+
+        Ok(())
+    }
+
     /// Destroy and leave `self` in an invalid state.
     ///
     /// # Safety
@@ -218,6 +292,14 @@ impl Image {
 pub struct Images {
     pub images: Vec<Image>,
     pub block: MemoryBlock,
+}
+
+impl Index<usize> for Images {
+    type Output = Image;
+
+    fn index(&self, idx: usize) -> &Self::Output {
+        &self.images[idx]
+    }
 }
 
 impl Images {
@@ -256,6 +338,9 @@ impl Images {
 
                 Ok(Image {
                     handle,
+                    extent: image_info.extent,
+                    layout: image_info.initial_layout,
+                    format: image_info.format,
                     view: vk::ImageView::null(),
                     range: start..end,
                 })
@@ -298,152 +383,6 @@ impl Images {
     pub unsafe fn destroy(&self, device: &Device) {
         self.images.iter().for_each(|image| image.destroy(device));
         self.block.free(device);
-    }
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct Vertex {
-    position: [f32; 3],
-}
-
-pub struct Mesh {
-    pub vertex_buffer: Buffer,
-    pub index_buffer: Buffer,
-    pub index_count: u32,
-    block: MemoryBlock,
-}
-
-impl Mesh {
-    pub fn from_obj(device: &Device, path: &Path) -> Result<Self> {
-        let mesh = MeshData::from_obj(path)?;
-
-        let stagings = {
-            let memory_flags =
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-
-            let create_infos = [
-                vk::BufferCreateInfo::builder()
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                    .size(mesh.verts.len() as u64)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .build(),
-                vk::BufferCreateInfo::builder()
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                    .size(mesh.indices.len() as u64)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .build(),
-            ];
-
-            Buffers::new(device, &create_infos, memory_flags, 4)?
-        };
-
-        unsafe {
-            let mapped = stagings.block.map(device)?;
-
-            mapped.get_range(&stagings.buffers[0].range).copy_from_slice(&mesh.verts);
-            mapped.get_range(&stagings.buffers[1].range).copy_from_slice(&mesh.indices);
-
-            stagings.block.unmap(device);
-        }
-
-        let buffers = {
-            let memory_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-
-            let create_infos = [
-                vk::BufferCreateInfo::builder()
-                    .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-                    .size(mesh.verts.len() as u64)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .build(),
-                vk::BufferCreateInfo::builder()
-                    .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-                    .size(mesh.indices.len() as u64)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .build(),
-            ];
-
-            Buffers::new(device, &create_infos, memory_flags, 4)?
-        };
-
-        device.transfer(|command_buffer| {
-            for (src, dst) in stagings.buffers.iter().zip(buffers.buffers.iter()) {
-                assert_eq!(src.size(), dst.size());
-
-                let regions = [vk::BufferCopy::builder()
-                    .src_offset(0)
-                    .dst_offset(0)
-                    .size(src.size())
-                    .build()];
-
-                unsafe {
-                    device
-                        .handle
-                        .cmd_copy_buffer(command_buffer, src.handle, dst.handle, &regions);
-                }
-            }
-        })?;
-
-        unsafe {
-            stagings.destroy(device);
-        }
-
-        let index_count = (mesh.indices.len() / std::mem::size_of::<u32>()) as u32;
-
-        let vertex_buffer = buffers.buffers[0].clone();
-        let index_buffer = buffers.buffers[1].clone();
-
-        Ok(Self {
-            index_count,
-            block: buffers.block,
-            vertex_buffer,
-            index_buffer,
-        })
-    }
-
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        self.vertex_buffer.destroy(device);
-        self.index_buffer.destroy(device);
-        self.block.free(device);
-    }
-}
-
-struct MeshData {
-    verts: Vec<u8>,
-    indices: Vec<u8>,
-}
-
-impl MeshData {
-    fn from_obj(path: &Path) -> Result<Self> {
-        let load_options = tobj::LoadOptions {
-            merge_identical_points: false,
-            single_index: false,
-            ignore_lines: true,
-            ignore_points: true,
-            triangulate: false,
-        };
-
-        let (models, _) = tobj::load_obj(path, &load_options)?;
-
-        let verts: Vec<_> = models
-            .iter()
-            .take(1)
-            .flat_map(|model| model.mesh.positions.as_slice())
-            .flat_map(|pos| pos.to_le_bytes())
-            .collect();
-        let indices: Vec<_> = models
-            .iter()
-            .take(1)
-            .flat_map(|model| model.mesh.indices.as_slice())
-            .flat_map(|index| index.to_le_bytes())
-            .collect();
-
-        Ok(Self { verts, indices })
     }
 }
 
