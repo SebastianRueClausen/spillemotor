@@ -1,4 +1,4 @@
-use glam::Mat4;
+use glam::{Vec3, Vec2, Mat4};
 use anyhow::Result;
 use ash::vk;
 
@@ -6,14 +6,40 @@ use std::{fs, io, mem};
 use std::path::{PathBuf, Path};
 use std::ops::Index;
 
+use crate::util;
 use crate::core::{Device, Swapchain, RenderPass, RenderTargets, UniformBuffers, Pipeline};
 use crate::resource::{Images, Buffers};
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct Vertex {
-    pub position: [f32; 3],
-    pub texcoord: [f32; 2],
+    pub position: Vec3,
+    pub normal: Vec3,
+    pub texcoord: Vec2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct DirLight {
+    /// The direction to the light.
+    pub direction: Vec3,
+    pub irradiance: Vec3,
+}
+
+impl Default for DirLight {
+    fn default() -> Self {
+        Self {
+            direction: Vec3::new(-1.0, -1.0, 0.0).normalize(),
+            irradiance: Vec3::splat(1.0),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct PointLight {
+    pub pos: Vec3,
+    pub lum: Vec3,
 }
 
 pub struct Model {
@@ -64,9 +90,18 @@ impl Index<usize> for Models {
     }
 }
 
+#[repr(C)]
+pub struct MaterialParams {
+    pub roughness: f32,
+    pub metallic: f32,
+}
+
+unsafe impl util::Pod for MaterialParams {}
+
 pub struct Material {
     pub base_color: usize,
     pub pipeline: Pipeline,
+    pub params: MaterialParams,
 }
 
 impl Material {
@@ -155,7 +190,7 @@ impl Scene {
                 mapped.get_range(&dst.range).copy_from_slice(&src);
             });
 
-        staging.block.unmap(device);
+        staging.block.unmap(device, mapped);
 
         let buffers = {
             let create_infos: Vec<_> = scene_data.meshes
@@ -183,7 +218,7 @@ impl Scene {
         };
 
         device.transfer(|command_buffer| {
-            for (src, dst) in staging.buffers.iter().zip(buffers.buffers.iter()) {
+            for (src, dst) in staging.iter().zip(buffers.iter()) {
                 assert_eq!(src.size(), dst.size());
 
                 let regions = [vk::BufferCopy::builder()
@@ -223,14 +258,15 @@ impl Scene {
 
         let mapped = staging.block.map(device)?;
 
-        scene_data.materials.iter()
+        scene_data.materials
+            .iter()
             .map(|mat| mat.base_color.data.as_slice())
-            .zip(staging.buffers.iter())
+            .zip(staging.iter())
             .for_each(|(src, dst)| unsafe {
                 mapped.get_range(&dst.range).copy_from_slice(&src);
             });
 
-        staging.block.unmap(device);
+        staging.block.unmap(device, mapped);
 
         let mut images = {
             let image_infos: Vec<_> = scene_data.materials
@@ -281,7 +317,7 @@ impl Scene {
         }
 
         device.transfer(|command_buffer| {
-            for (src, dst) in staging.buffers.iter().zip(images.images.iter()) {
+            for (src, dst) in staging.iter().zip(images.iter()) {
                 assert_eq!(src.size(), dst.size());
                 let subresource = vk::ImageSubresourceLayers::builder()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -333,7 +369,7 @@ impl Scene {
         let materials: Result<Vec<_>> = scene_data.materials
             .iter()
             .enumerate()
-            .map(|(base_color, _)| {
+            .map(|(base_color, mat)| {
                 let view = images[base_color].view;
                 let pipeline = Pipeline::new_render(
                     device,
@@ -347,6 +383,10 @@ impl Scene {
                 Ok(Material {
                     base_color,
                     pipeline,
+                    params: MaterialParams {
+                        metallic: mat.metallic,
+                        roughness: mat.roughness,
+                    },
                 })
             })
             .collect();
@@ -394,7 +434,6 @@ fn create_texture_sampler(device: &Device) -> Result<vk::Sampler> {
         .mip_lod_bias(0.0)
         .min_lod(0.0)
         .max_lod(0.0);
-
     Ok(unsafe {
         device.handle.create_sampler(&create_info, None)?
     })
@@ -419,7 +458,9 @@ struct MeshData {
 }
 
 struct MaterialData {
-    base_color: ImageData, 
+    base_color: ImageData,
+    metallic: f32,
+    roughness: f32,
 }
 
 impl SceneData {
@@ -509,8 +550,16 @@ impl SceneData {
                     .texture()
                     .source()
                     .source();
+                let metallic = mat
+                    .pbr_metallic_roughness()
+                    .metallic_factor();
+                let roughness = mat
+                    .pbr_metallic_roughness()
+                    .roughness_factor();
                 Ok(MaterialData {
                     base_color: load_image(&base_color)?,
+                    metallic,
+                    roughness,
                 })
             })
             .collect();
@@ -532,56 +581,60 @@ impl SceneData {
 
                 let verts = {
                     let positions = primitive.get(&gltf::Semantic::Positions);
+                    let normals = primitive.get(&gltf::Semantic::Normals);
                     let texcoords = primitive.get(&gltf::Semantic::TexCoords(0));
 
-                    let (Some(positions), Some(texcoords)) = (positions, texcoords) else {
+                    let (Some(positions), Some(texcoords), Some(normals)) =
+                        (positions, texcoords, normals) else
+                    {
                         return Err(anyhow!(
-                            "prmitive {} doesn't have both positions and texcoords",
+                            "prmitive {} doesn't have both positions, texcoords and normals",
                             primitive.index(),
                         ));
                     };
 
-                    let data_type = positions.data_type();
-                    let dimensions = positions.dimensions();
-
                     use gltf::accessor::{DataType, Dimensions};
-                    let (DataType::F32, Dimensions::Vec3) = (data_type, dimensions) else {
-                        return Err(anyhow!(
-                            "position attribute, accessor {}, must be a `vec3` of `f32`",
-                            positions.index(),
-                        ));
-                    };
 
-                    let positions = {
-                        let Some(view) = positions.view() else {
-                            return Err(anyhow!("no view on accessor {}", positions.index()));
+                    fn check_format(
+                        acc: &gltf::Accessor,
+                        dt: DataType,
+                        d: Dimensions,
+                    ) -> Result<()> {
+                        if dt != acc.data_type() {
+                            return Err(anyhow!( "accessor {} must be a {dt:?}", acc.index()));
+                        }
+                        if d != acc.dimensions() {
+                            return Err(anyhow!( "accessor {} must be a {d:?}", acc.index()));
+                        }
+                        Ok(())
+                    }
+                
+                    check_format(&positions, DataType::F32, Dimensions::Vec3)?;
+                    check_format(&normals, DataType::F32, Dimensions::Vec3)?;
+                    check_format(&texcoords, DataType::F32, Dimensions::Vec2)?;
+
+                    let get_accessor_data = |acc: &gltf::Accessor| -> Result<Vec<u8>> {
+                        let Some(view) = acc.view() else {
+                            return Err(anyhow!("no view on accessor {}", acc.index()));
                         };
-
-                        let offset = positions.offset();
-                        let size = positions.count() * positions.size();
-
-                        get_buffer_data(&view, offset, Some(size))
+                        Ok(get_buffer_data(&view, acc.offset(), Some(acc.count() * acc.size())))
                     };
 
-                    let texcoords = {
-                        let Some(view) = texcoords.view() else {
-                            return Err(anyhow!("no view on accessor {}", texcoords.index()));
-                        };
-
-                        let offset = texcoords.offset();
-                        let size = texcoords.count() * texcoords.size();
-
-                        get_buffer_data(&view, offset, Some(size))
-                    };
+                    let positions = get_accessor_data(&positions)?;
+                    let normals = get_accessor_data(&normals)?;
+                    let texcoords = get_accessor_data(&texcoords)?;
 
                     assert_eq!(positions.len() / 3, texcoords.len() / 2);
+                    assert_eq!(positions.len() / 3, normals.len() / 3);
 
                     positions
                         .as_slice()
                         .chunks(12)
+                        .zip(normals.as_slice().chunks(12))
                         .zip(texcoords.as_slice().chunks(8))
-                        .flat_map(|(p, c)| [
+                        .flat_map(|((p, n), c)| [
                             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11],
+                            n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11],
                             c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
                         ])
                         .collect()
@@ -598,7 +651,7 @@ impl SceneData {
                     use gltf::accessor::{DataType, Dimensions};
                     let (DataType::U16, Dimensions::Scalar) = (data_type, dimensions) else {
                         return Err(anyhow!(
-                            "index attribute, accessor {}, must be a `vec3` of `f32`",
+                            "index attribute, accessor {}, must be scalar `u16`",
                             indices.index(),
                         ));
                     };

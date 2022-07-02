@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ash::extensions::{ext, khr};
 use ash::vk;
-use glam::Mat4;
+use glam::{Vec3, Mat4};
 
 use std::ffi::{self, CStr, CString};
 use std::path::Path;
@@ -9,7 +9,8 @@ use std::mem;
 
 use crate::camera::Camera;
 use crate::resource::{Buffers, Image, Images, MappedMemory, MemoryBlock};
-use crate::scene::{Scene, Vertex, SceneData};
+use crate::scene::{Scene, Vertex, SceneData, DirLight, MaterialParams};
+use crate::util;
 
 pub struct Renderer {
     device: Device,
@@ -17,7 +18,8 @@ pub struct Renderer {
     render_pass: RenderPass,
     frame_queue: FrameQueue,
     uniform_buffers: UniformBuffers,
-    uniform_data: UniformData,
+    vert_uniform: VertUniform,
+    frag_uniform: FragUniform,
     render_targets: RenderTargets,
     scene: Scene,
     pub camera: Camera,
@@ -35,8 +37,12 @@ impl Renderer {
         let render_pass = RenderPass::new(&device, &swapchain, &render_targets)?;
         let frame_queue = FrameQueue::new(&device)?;
         let uniform_buffers = UniformBuffers::new(&device)?;
-        let uniform_data = UniformData::default();
+
+        let vert_uniform = VertUniform::default();
+        let frag_uniform = FragUniform::default();
+
         let scene_data = SceneData::from_gltf(Path::new("models/duck/Duck0.gltf"))?;
+
         let scene = Scene::from_scene_data(
             &device,
             &swapchain,
@@ -53,7 +59,8 @@ impl Renderer {
             render_pass,
             frame_queue,
             uniform_buffers,
-            uniform_data,
+            vert_uniform,
+            frag_uniform,
             render_targets,
             scene,
             camera,
@@ -97,10 +104,14 @@ impl Renderer {
                     self.device.handle.reset_fences(&[frame.ready_to_draw])?;
                 }
 
-                // Upload uniform buffer data.
-                self.uniform_data.update(&self.camera);
-                self.uniform_buffers
-                    .upload_data(self.frame_queue.frame_index as u64, &self.uniform_data);
+                self.vert_uniform.update(&self.camera);
+                self.frag_uniform.update(&self.camera);
+
+                self.uniform_buffers.upload_data(
+                    self.frame_queue.frame_index,
+                    &self.vert_uniform,
+                    &self.frag_uniform,
+                );
 
                 // Record the command buffer.
                 unsafe {
@@ -221,6 +232,14 @@ impl Renderer {
                             model.transform_data(),
                         );
 
+                        self.device.handle.cmd_push_constants(
+                            frame.command_buffer,
+                            material.pipeline.layout,
+                            vk::ShaderStageFlags::FRAGMENT,
+                            mem::size_of::<Mat4>() as u32,
+                            util::bytes_of(&material.params),
+                        );
+
                         self.device.handle.cmd_draw_indexed(
                             frame.command_buffer,
                             model.index_count,
@@ -282,24 +301,22 @@ impl Renderer {
         }
     }
 
+    /// Handle window resize. The extent of the swapchain and framebuffers will we match that of
+    /// `window`.
     pub fn resize(&mut self, window: &winit::window::Window) -> Result<()> {
         trace!("resizing");
-
         unsafe {
             self.device
                 .handle
                 .device_wait_idle()
                 .expect("failed waiting for idle device");
-
             self.render_targets.destroy(&self.device);
             self.render_pass.destroy(&self.device);
         }
-
         let extent = vk::Extent2D {
             width: window.inner_size().width,
             height: window.inner_size().height,
         };
-
         self.swapchain.recreate(&self.device, extent)?;
         self.render_targets = RenderTargets::new(&self.device, &self.swapchain)?;
         self.render_pass = RenderPass::new(&self.device, &self.swapchain, &self.render_targets)?;
@@ -337,8 +354,9 @@ pub struct Device {
 
     pub handle: ash::Device,
 
-    #[allow(dead_code)]
+    #[allow(unused)]
     entry: ash::Entry,
+
     instance: ash::Instance,
     physical: vk::PhysicalDevice,
 
@@ -346,18 +364,13 @@ pub struct Device {
     pub device_properties: vk::PhysicalDeviceProperties,
 
     surface: Surface,
-
     messenger: DebugMessenger,
-
     /// Queue used to submit render commands.
     graphics_queue: Queue,
-
-    /// Queue used to submut transfer commands.
+    /// Queue used to submut transfer commands, may be the same as `graphics_queue`.
     transfer_queue: Queue,
-
     /// Graphics pool fore recording render commands.
     graphics_pool: vk::CommandPool,
-
     /// Command pool for recording transfer commands. Not used for any rendering.
     transfer_pool: vk::CommandPool,
 }
@@ -436,6 +449,7 @@ impl Device {
         let surface = Surface::new(&instance, &entry, &window)?;
         let messenger = DebugMessenger::new(&entry, &instance, &debug_info)?;
 
+        // Select a physical device from heuristics. TODO: Improve this.
         let physical = unsafe {
             instance
                 .enumerate_physical_devices()?
@@ -448,7 +462,7 @@ impl Device {
                         .unwrap_or("invalid")
                         .to_string();
 
-                    trace!("device candicate {name}");
+                    trace!("device candicate: {name}");
 
                     let mut score = 0;
                     if properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
@@ -560,26 +574,23 @@ impl Device {
 
         Ok(Self {
             name,
-
             entry,
             instance,
             physical,
             handle,
-
             memory_properties,
             device_properties,
-
             surface,
             messenger,
-
             graphics_queue,
             transfer_queue,
-
             transfer_pool,
             graphics_pool,
         })
     }
 
+    /// Record and submut a command seqeunce to `Self::transfer_queue`. This will be performed
+    /// immediately, meaning that the transfer will be done before this function returns.
     pub fn transfer(&self, mut func: impl FnMut(vk::CommandBuffer)) -> Result<()> {
         let buffers = unsafe {
             let info = vk::CommandBufferAllocateInfo::builder()
@@ -588,7 +599,6 @@ impl Device {
                 .command_buffer_count(1);
             self.handle.allocate_command_buffers(&info)?
         };
-
         unsafe {
             let begin_info = vk::CommandBufferBeginInfo::builder()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -612,6 +622,8 @@ impl Device {
         Ok(())
     }
 
+    /// Get the sample count for msaa. For now it just the highest sample count the device
+    /// supports, but below 8 samples.
     fn sample_count(&self) -> vk::SampleCountFlags {
         let counts = self.device_properties.limits.framebuffer_depth_sample_counts;
 
@@ -646,6 +658,7 @@ impl Device {
     }
 }
 
+/// State relating to the printing vulkan debug info.
 pub struct DebugMessenger {
     loader: ext::DebugUtils,
     handle: vk::DebugUtilsMessengerEXT,
@@ -667,7 +680,7 @@ impl DebugMessenger {
     ///
     /// # Safety
     ///
-    /// Don't use `self` after calling this function.
+    /// Don't call this before destroying all objects using this for messaging.
     unsafe fn destroy(&self) {
         self.loader.destroy_debug_utils_messenger(self.handle, None);
     }
@@ -865,11 +878,14 @@ pub struct Frame {
     /// This get's signaled when the frame has been presented and is then available to draw to
     /// again.
     presented: vk::Semaphore,
+
     /// This get's signaled when the GPU is done drawing to the frame and the frame is then ready
     /// to be presented.
     rendered: vk::Semaphore,
+
     /// This is essentially the same as `presented`, but used to sync with the CPU.
     ready_to_draw: vk::Fence,
+
     /// Command buffer to for drawing and transfers. This has to be re-recorded before each frame,
     /// since the amount of frames (most likely) doesn't match the number if swapchain images.
     command_buffer: vk::CommandBuffer,
@@ -894,7 +910,6 @@ impl Frame {
 }
 
 pub struct FrameQueue {
-    /// All the frames in a queue.
     frames: Vec<Frame>,
     /// The index of the frame currently being rendered or presented. It changes just before
     /// rendering of the next image begins.
@@ -907,9 +922,7 @@ impl FrameQueue {
             let command_buffer_info = vk::CommandBufferAllocateInfo::builder()
                 .command_pool(device.graphics_pool)
                 .command_buffer_count(FRAMES_IN_FLIGHT as u32);
-
-            device
-                .handle
+            device.handle
                 .allocate_command_buffers(&command_buffer_info)?
         };
 
@@ -1060,10 +1073,8 @@ impl SwapchainImage {
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .format(format)
                 .subresource_range(*subresource_range);
-
             device.handle.create_image_view(&view_info, None)?
         };
-
         Ok(SwapchainImage { image, view })
     }
 }
@@ -1113,7 +1124,6 @@ impl RenderTargets {
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(DEPTH_IMAGE_FORMAT)
             .subresource_range(depth_subresource_info);
-
         let msaa_image_info = vk::ImageCreateInfo::builder()
             .image_type(vk::ImageType::TYPE_2D)
             .usage(vk::ImageUsageFlags::TRANSIENT_ATTACHMENT
@@ -1137,8 +1147,7 @@ impl RenderTargets {
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(swapchain.surface_format.format)
             .subresource_range(msaa_subresource_info);
-
-        let image_infos: Vec<vk::ImageCreateInfo> = [depth_image_info.build(), msaa_image_info.build()]
+        let image_infos: Vec<_> = [depth_image_info.build(), msaa_image_info.build()]
             .iter()
             .cycle()
             .map(|info| *info)
@@ -1158,8 +1167,7 @@ impl RenderTargets {
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
 
-        let targets = images
-            .images
+        let targets = images.images
             .as_slice()
             .chunks(2)
             .map(|images| RenderTarget {
@@ -1207,22 +1215,15 @@ impl Swapchain {
     /// if it aren't able to determine it from `surface`.
     pub fn new(device: &Device, extent: vk::Extent2D) -> Result<Self> {
         let (surface_formats, _present_modes, surface_caps) = unsafe {
-            let format = device
-                .surface
-                .loader
+            let format = device.surface.loader
                 .get_physical_device_surface_formats(device.physical, device.surface.handle)?;
-            let modes = device
-                .surface
-                .loader
+            let modes = device.surface.loader
                 .get_physical_device_surface_present_modes(
                     device.physical,
                     device.surface.handle,
                 )?;
-            let caps = device
-                .surface
-                .loader
+            let caps = device.surface.loader
                 .get_physical_device_surface_capabilities(device.physical, device.surface.handle)?;
-
             (format, modes, caps)
         };
 
@@ -1253,13 +1254,11 @@ impl Swapchain {
                 ),
             }
         };
-
         let present_mode = _present_modes
             .iter()
             .any(|mode| *mode == vk::PresentModeKHR::MAILBOX)
             .then(|| vk::PresentModeKHR::MAILBOX)
             .unwrap_or(vk::PresentModeKHR::FIFO);
-
         let swapchain_info = vk::SwapchainCreateInfoKHR::builder()
             .surface(device.surface.handle)
             .min_image_count(min_image_count)
@@ -1273,7 +1272,6 @@ impl Swapchain {
             .present_mode(present_mode)
             .image_extent(extent)
             .image_array_layers(1);
-
         let loader = khr::Swapchain::new(&device.instance, &device.handle);
         let handle = unsafe { loader.create_swapchain(&swapchain_info, None)? };
 
@@ -1307,9 +1305,7 @@ impl Swapchain {
         }
 
         let surface_caps = unsafe {
-            device
-                .surface
-                .loader
+            device.surface.loader
                 .get_physical_device_surface_capabilities(device.physical, device.surface.handle)?
         };
 
@@ -1335,7 +1331,6 @@ impl Swapchain {
 
         unsafe {
             self.loader.destroy_swapchain(self.handle, None);
-
             for image in &self.images {
                 device.handle.destroy_image_view(image.view, None);
             }
@@ -1375,35 +1370,76 @@ impl Swapchain {
 
 #[repr(C)]
 #[derive(Clone, Default)]
-pub struct UniformData {
+pub struct VertUniform {
     perspective: Mat4,
     view: Mat4,
 }
 
-impl UniformData {
+unsafe impl util::Pod for VertUniform {}
+
+impl VertUniform {
     fn update(&mut self, camera: &Camera) {
         self.perspective = camera.perspective;
         self.view = camera.view;
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Default)]
+pub struct FragUniform {
+    dir_light: DirLight,
+    camera_pos: Vec3,
+}
+
+unsafe impl util::Pod for FragUniform {}
+
+impl FragUniform {
+    fn update(&mut self, camera: &Camera) {
+        self.camera_pos = camera.pos;
+    }
+}
+
+/// Container of all uniform buffers.
+///
+/// Each frame contains two uniform buffers, one for the vertex shader and one for the fragment
+/// shader, which holds the data of [`VertexUbo`] and [`FragmentUbo`] respectively. They are laid
+/// out in `buffers` as follows.
+///
+/// | Frame | Stage |
+/// |-------|-------|
+/// | 0     | vert  |
+/// | 0     | frag  |
+/// | 1     | vert  |
+/// | 1     | frag  |
+///
 pub struct UniformBuffers {
-    /// One buffer for each frame.
     buffers: Buffers,
-    /// Mapped memory of all the buffers.
     mapped: MappedMemory,
 }
 
 impl UniformBuffers {
     pub fn new(device: &Device) -> Result<Self> {
-        let create_info = vk::BufferCreateInfo::builder()
-            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .size(mem::size_of::<UniformData>() as u64);
+        let create_infos = [
+            vk::BufferCreateInfo::builder()
+                .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .size(mem::size_of::<VertUniform>() as u64)
+                .build(),
+            vk::BufferCreateInfo::builder()
+                .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .size(mem::size_of::<FragUniform>() as u64)
+                .build(),
+        ];
 
-        let create_infos = [create_info.build(); FRAMES_IN_FLIGHT];
+        let create_infos: Vec<vk::BufferCreateInfo> = create_infos
+            .iter()
+            .cycle()
+            .take(FRAMES_IN_FLIGHT * 2)
+            .map(|info| *info)
+            .collect();
+
         let alignment = device.device_properties.limits.non_coherent_atom_size;
-
         let memory_flags =
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
@@ -1413,11 +1449,18 @@ impl UniformBuffers {
         Ok(UniformBuffers { buffers, mapped })
     }
 
-    fn upload_data(&self, frame_index: u64, data: &UniformData) {
-        unsafe {
-            let frames: &mut [UniformData] = self.mapped.as_slice();
-            frames[frame_index as usize] = data.clone();
-        }
+    /// Upload data from `vert` and `frag` into the buffers associated with the frame of index
+    /// `frame_index`.
+    fn upload_data(&self, frame_index: usize, vert: &VertUniform, frag: &FragUniform) {
+        let (vert_mem, frag_mem) = unsafe {
+            let vert_buf = &self.buffers[frame_index * 2];
+            let frag_buf = &self.buffers[frame_index * 2 + 1];
+
+            (self.mapped.get_range(&vert_buf.range), self.mapped.get_range(&frag_buf.range))
+        };
+
+        vert_mem.copy_from_slice(util::bytes_of(vert));
+        frag_mem.copy_from_slice(util::bytes_of(frag));
     }
 
     /// Destroy and leave `self` in an invalid state.
@@ -1451,6 +1494,7 @@ pub struct Pipeline {
     layout: vk::PipelineLayout,
     descriptor_pool: vk::DescriptorPool,
     descriptor_layout: vk::DescriptorSetLayout,
+    /// One descriptor set for each frame.
     descriptor_sets: Vec<vk::DescriptorSet>,
 }
 
@@ -1470,6 +1514,7 @@ impl Pipeline {
         let fragment_module = create_shader_module(
             &device, include_bytes_aligned_as!(u32, "../shaders/frag.spv"),
         )?;
+
         let entry = CString::new("main").unwrap();
         let shader_stages = [
             vk::PipelineShaderStageCreateInfo::builder()
@@ -1483,6 +1528,7 @@ impl Pipeline {
                 .name(&entry)
                 .build(),
         ];
+
         let vert_attrib = [
             vk::VertexInputAttributeDescription {
                 format: vk::Format::R32G32B32_SFLOAT,
@@ -1491,27 +1537,36 @@ impl Pipeline {
                 offset: 0,
             },
             vk::VertexInputAttributeDescription {
-                format: vk::Format::R32G32_SFLOAT,
+                format: vk::Format::R32G32B32_SFLOAT,
                 binding: 0,
                 location: 1,
-                offset: mem::size_of::<[f32; 3]>() as u32,
+                offset: mem::size_of::<Vec3>() as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                format: vk::Format::R32G32_SFLOAT,
+                binding: 0,
+                location: 2,
+                offset: mem::size_of::<[Vec3; 2]>() as u32,
             },
         ];
+
         let vert_binding = [vk::VertexInputBindingDescription {
             binding: 0,
             stride: mem::size_of::<Vertex>() as u32,
             input_rate: vk::VertexInputRate::VERTEX,
         }];
+
         let vert_input_info = vk::PipelineVertexInputStateCreateInfo::builder()
             .vertex_attribute_descriptions(&vert_attrib)
             .vertex_binding_descriptions(&vert_binding);
         let vert_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
         let descriptor_pool = unsafe {
             let sizes = [
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
-                    descriptor_count: FRAMES_IN_FLIGHT as u32,
+                    descriptor_count: FRAMES_IN_FLIGHT as u32 * 2,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
@@ -1523,29 +1578,38 @@ impl Pipeline {
                 .max_sets(FRAMES_IN_FLIGHT as u32);
             device.handle.create_descriptor_pool(&info, None)?
         };
+
         let descriptor_layout = unsafe {
             let layout_bindings = [
-                // Perspective matrix.
+                // Vertex uniform buffer object.
                 vk::DescriptorSetLayoutBinding::builder()
                     .binding(0)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                     .descriptor_count(1)
                     .stage_flags(vk::ShaderStageFlags::VERTEX)
                     .build(),
-                // Texture sampler.
+                // Fragment uniform buffer object.
                 vk::DescriptorSetLayoutBinding::builder()
                     .binding(1)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                    .build(),
+                // Texture sampler.
+                vk::DescriptorSetLayoutBinding::builder()
+                    .binding(2)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .descriptor_count(1)
                     .stage_flags(vk::ShaderStageFlags::FRAGMENT)
                     .build(),
             ];
+
             let layout_info =
                 vk::DescriptorSetLayoutCreateInfo::builder().bindings(&layout_bindings);
-            device
-                .handle
-                .create_descriptor_set_layout(&layout_info, None)?
+
+            device.handle.create_descriptor_set_layout(&layout_info, None)?
         };
+
         let descriptor_sets = unsafe {
             let layouts = vec![descriptor_layout; FRAMES_IN_FLIGHT];
             let alloc_info = vk::DescriptorSetAllocateInfo::builder()
@@ -1553,11 +1617,17 @@ impl Pipeline {
                 .set_layouts(&layouts);
             device.handle.allocate_descriptor_sets(&alloc_info)?
         };
-        for (set, buffer) in descriptor_sets.iter().zip(uniform_buffers.buffers.buffers.iter()) {
-            let buffer_infos = [vk::DescriptorBufferInfo {
-                buffer: buffer.handle,
+
+        for (set, buffers) in descriptor_sets.iter().zip(uniform_buffers.buffers.chunks(2)) {
+            let vert_infos = [vk::DescriptorBufferInfo {
+                buffer: buffers[0].handle,
                 offset: 0,
-                range: buffer.size(),
+                range: buffers[0].size(),
+            }];
+            let frag_infos = [vk::DescriptorBufferInfo {
+                buffer: buffers[1].handle,
+                offset: 0,
+                range: buffers[1].size(),
             }];
             let image_infos = [vk::DescriptorImageInfo {
                 image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -1569,17 +1639,24 @@ impl Pipeline {
                     .dst_set(*set)
                     .dst_binding(0)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .buffer_info(&buffer_infos)
+                    .buffer_info(&vert_infos)
                     .build(),
                 vk::WriteDescriptorSet::builder()
                     .dst_set(*set)
                     .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&frag_infos)
+                    .build(),
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(*set)
+                    .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&image_infos)
                     .build(),
             ];
             unsafe { device.handle.update_descriptor_sets(&writes, &[]) }
         }
+
         let viewports = [vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -1588,10 +1665,12 @@ impl Pipeline {
             min_depth: 0.0,
             max_depth: 1.0,
         }];
+
         let scissors = [vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: swapchain.extent,
         }];
+
         let viewport_info = vk::PipelineViewportStateCreateInfo::builder()
             .viewports(&viewports)
             .scissors(&scissors);
@@ -1617,13 +1696,23 @@ impl Pipeline {
                     | vk::ColorComponentFlags::A,
             )
             .build()];
+
         let color_blend_info =
             vk::PipelineColorBlendStateCreateInfo::builder().attachments(&color_blend_attachments);
-        let push_constant_ranges = [vk::PushConstantRange::builder()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
-            .size(mem::size_of::<Mat4>() as u32)
-            .offset(0)
-            .build()];
+
+        let push_constant_ranges = [
+            vk::PushConstantRange::builder()
+                .stage_flags(vk::ShaderStageFlags::VERTEX)
+                .size(mem::size_of::<Mat4>() as u32)
+                .offset(0)
+                .build(),
+            vk::PushConstantRange::builder()
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .size(mem::size_of::<MaterialParams>() as u32)
+                .offset(mem::size_of::<Mat4>() as u32)
+                .build(),
+        ];
+
         let layout = unsafe {
             let layouts = [descriptor_layout];
             let info = vk::PipelineLayoutCreateInfo::builder()
@@ -1631,6 +1720,7 @@ impl Pipeline {
                 .push_constant_ranges(&push_constant_ranges);
             device.handle.create_pipeline_layout(&info, None)?
         };
+
         let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::builder()
             .depth_test_enable(true)
             .depth_write_enable(true)

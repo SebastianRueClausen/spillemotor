@@ -54,7 +54,7 @@ impl InputState {
 }
 
 pub struct Camera {
-    position: Vec3,
+    pub pos: Vec3,
     front: Vec3,
     up: Vec3,
 
@@ -73,7 +73,7 @@ pub struct Camera {
 
 impl Camera {
     pub fn new(aspect_ratio: f32) -> Self {
-        let position = Vec3::new(10.0, 10.0, 10.0);
+        let pos = Vec3::new(10.0, 10.0, 10.0);
         let up = Vec3::new(0.0, 1.0, 0.0);
         let front = Vec3::default();
 
@@ -84,7 +84,7 @@ impl Camera {
         let znear = 0.01;
         let zfar = 1000.0;
 
-        let view = Mat4::look_at_rh(position, position, up);
+        let view = Mat4::look_at_rh(pos, pos + front, up);
         let perspective = Mat4::perspective_rh(
             fov.to_radians(),
             aspect_ratio,
@@ -94,8 +94,8 @@ impl Camera {
 
         Self {
             rotation_speed: 0.5,
-            movement_speed: 15.0,
-            position,
+            movement_speed: 60.0,
+            pos,
             up,
             front,
             yaw,
@@ -113,16 +113,16 @@ impl Camera {
         let speed = self.movement_speed * dt.as_secs_f32();
 
         if input_state.is_key_pressed(VirtualKeyCode::W) {
-            self.position += self.front * speed;
+            self.pos += self.front * speed;
         }
         if input_state.is_key_pressed(VirtualKeyCode::S) {
-            self.position -= self.front * speed;
+            self.pos -= self.front * speed;
         }
         if input_state.is_key_pressed(VirtualKeyCode::A) {
-            self.position -= self.front.cross(self.up).normalize() * speed;
+            self.pos -= self.front.cross(self.up).normalize() * speed;
         }
         if input_state.is_key_pressed(VirtualKeyCode::D) {
-            self.position += self.front.cross(self.up).normalize() * speed;
+            self.pos += self.front.cross(self.up).normalize() * speed;
         }
 
         let (x_delta, y_delta) = input_state.mouse_delta();
@@ -139,7 +139,7 @@ impl Camera {
         )
         .normalize();
 
-        self.view = Mat4::look_at_rh(self.position, self.position + self.front, self.up);
+        self.view = Mat4::look_at_rh(self.pos, self.pos + self.front, self.up);
     }
 
     pub fn update_perspective(&mut self, aspect_ratio: f32) {
