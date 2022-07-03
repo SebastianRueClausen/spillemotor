@@ -14,6 +14,7 @@ mod resource;
 mod core;
 mod util;
 mod scene;
+mod light;
 
 use anyhow::Result;
 

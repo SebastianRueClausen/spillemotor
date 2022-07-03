@@ -89,7 +89,7 @@ impl MemoryBlock {
 
     /// Bind `buffer` to a slice of the memory owned by `self. The memory range is determined by
     /// `buffer` and the function will fail if that range goes past the end of the memory block.
-    pub fn bind_buffer(&self, device: &Device, buffer: &Buffer) -> Result<()> {
+    pub fn bind_buffer(&self, device: &Device, buffer: &BufferView) -> Result<()> {
         unsafe {
             device.handle.bind_buffer_memory(buffer.handle, self.handle, buffer.range.start)?;
         }
@@ -98,7 +98,6 @@ impl MemoryBlock {
     }
 
     /// Map the whole memory block.
-    ///
     /// May fail if the memory isn't host visble.
     pub fn map(&self, device: &Device) -> Result<MappedMemory> {
         let ptr = unsafe {
@@ -116,7 +115,7 @@ impl MemoryBlock {
     /// Unmap the the memory of self. It must consume a [`MappedMemory`] object to both insure that
     /// the memory is current mapped, and to insure said mapped memory isn't used after calling
     /// this.
-    pub fn unmap<'a>(&self, device: &Device, _mapped: MappedMemory) {
+    pub fn unmap(&self, device: &Device, _mapped: MappedMemory) {
         unsafe { device.handle.unmap_memory(self.handle); }
     }
 
@@ -132,21 +131,21 @@ impl MemoryBlock {
     }
 }
 
-/// A single buffer.
+/// A single buffer which doesn't own the memory.
 ///
-/// This doesn't own it's own memory device memory, and has therefore implicitly the lifetime of
-/// the owning [`Buffers`].
+/// This means that it implicitly has the lifetime the [`MemoryBlock`] owning the memory, and more
+/// common it's parent [`Buffers`] object.
 ///
 /// # Safety
 ///
-/// Don't use the buffer after destroying the owning [`Buffers`] object.
+/// Don't use the buffer after deallocating it's [`MemoryBlock`].
 #[derive(Debug, Clone)]
-pub struct Buffer {
+pub struct BufferView {
     pub handle: vk::Buffer,
     pub range: MemoryRange,
 }
 
-impl Buffer {
+impl BufferView {
     pub fn size(&self) -> vk::DeviceSize {
         self.range.end - self.range.start
     }
@@ -179,11 +178,11 @@ impl Buffer {
 /// each pair of buffers and copy them over.
 pub struct Buffers {
     pub block: MemoryBlock,
-    pub buffers: Vec<Buffer>,
+    pub buffers: Vec<BufferView>,
 }
 
 impl Index<usize> for Buffers {
-    type Output = Buffer;
+    type Output = BufferView;
 
     fn index(&self, idx: usize) -> &Self::Output {
         &self.buffers[idx]
@@ -193,11 +192,11 @@ impl Index<usize> for Buffers {
 impl Buffers {
     /// Buffers are often stored in chunks of the same size. This is an easy way to iterate over
     /// said chunks.
-    pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = &[Buffer]> {
+    pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = &[BufferView]> {
         self.buffers.as_slice().chunks(chunk_size)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Buffer> {
+    pub fn iter(&self) -> impl Iterator<Item = &BufferView> {
         self.buffers.iter()
     }
 
@@ -235,7 +234,7 @@ impl Buffers {
 
                 current_size = start + requirements.size;
 
-                Ok(Buffer {
+                Ok(BufferView {
                     handle,
                     range: start..end,
                 })
@@ -287,13 +286,14 @@ impl Buffers {
 /// A single image and image view which doesn't own it's own memory.
 ///
 /// This doesn't own it's own memory device memory, and has therefore implicitly the lifetime of
-/// the owning [`Images`].
+/// the owning [`Images`] or the [`MemoryBlock`] where the memory is allocated.
 ///
 /// # Safety
 ///
-/// Don't use the buffer after destroying the owning [`Images`] object.
+/// Don't use the buffer after destroying the owning [`Images`] object or deallocating the
+/// [`MemoryBlock`].
 #[derive(Clone)]
-pub struct Image {
+pub struct ImageView {
     pub handle: vk::Image,
     pub view: vk::ImageView,
     pub layout: vk::ImageLayout,
@@ -302,7 +302,7 @@ pub struct Image {
     pub range: MemoryRange,
 }
 
-impl Image {
+impl ImageView {
     /// The size of the image in bytes.
     pub fn size(&self) -> vk::DeviceSize {
         self.range.end - self.range.start
@@ -334,6 +334,7 @@ impl Image {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .subresource_range(subresource);
+
             let (src_stage, dst_stage) = match (self.layout, new) {
                 (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => {
                     barrier = barrier
@@ -383,18 +384,13 @@ impl Image {
 }
 
 /// An aggregate collection of images all located in a single memory block.
-///
-/// This is essentially equivalent to [`Buffers`], with one main difference: The images are only
-/// aligned to the individual requirements of each image, and not some common alignment
-/// requirement. This is simply because images aren't required to be aligned to some common
-/// aligment such as uniform buffers.
 pub struct Images {
-    pub images: Vec<Image>,
+    pub images: Vec<ImageView>,
     pub block: MemoryBlock,
 }
 
 impl Index<usize> for Images {
-    type Output = Image;
+    type Output = ImageView;
 
     fn index(&self, idx: usize) -> &Self::Output {
         &self.images[idx]
@@ -402,8 +398,14 @@ impl Index<usize> for Images {
 }
 
 impl Images {
-    pub fn iter(&self) -> impl Iterator<Item = &Image> {
+    pub fn iter(&self) -> impl Iterator<Item = &ImageView> {
         self.images.iter()
+    }
+
+    /// Images are often stored in chunks of the same size. This is an easy way to iterate over
+    /// said chunks.
+    pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = &[ImageView]> {
+        self.images.as_slice().chunks(chunk_size)
     }
 
     /// Allocate and create a collection of images and image infos.
@@ -445,7 +447,7 @@ impl Images {
                 memory_type_bits &= requirements.memory_type_bits;
                 current_size = end;
 
-                Ok(Image {
+                Ok(ImageView {
                     handle,
                     extent: image_info.extent,
                     layout: image_info.initial_layout,

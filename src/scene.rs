@@ -18,30 +18,6 @@ pub struct Vertex {
     pub texcoord: Vec2,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct DirLight {
-    /// The direction to the light.
-    pub direction: Vec3,
-    pub irradiance: Vec3,
-}
-
-impl Default for DirLight {
-    fn default() -> Self {
-        Self {
-            direction: Vec3::new(-1.0, -1.0, 0.0).normalize(),
-            irradiance: Vec3::splat(1.0),
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct PointLight {
-    pub pos: Vec3,
-    pub lum: Vec3,
-}
-
 pub struct Model {
     pub index_buffer: usize,
     pub vertex_buffer: usize,  

@@ -5,11 +5,12 @@ use glam::{Vec3, Mat4};
 
 use std::ffi::{self, CStr, CString};
 use std::path::Path;
-use std::mem;
+use std::{iter, mem};
 
 use crate::camera::Camera;
-use crate::resource::{Buffers, Image, Images, MappedMemory, MemoryBlock};
-use crate::scene::{Scene, Vertex, SceneData, DirLight, MaterialParams};
+use crate::resource::{Buffers, Images, MappedMemory};
+use crate::scene::{Scene, Vertex, SceneData, MaterialParams};
+use crate::light::{DirLight, LightBuffers};
 use crate::util;
 
 pub struct Renderer {
@@ -22,6 +23,7 @@ pub struct Renderer {
     frag_uniform: FragUniform,
     render_targets: RenderTargets,
     scene: Scene,
+    light_buffers: LightBuffers,
     pub camera: Camera,
 }
 
@@ -51,8 +53,11 @@ impl Renderer {
             &uniform_buffers,
             &scene_data,
         )?;
+
         let aspect_ratio = window_extent.width as f32 / window_extent.height as f32;
+        let light_buffers = LightBuffers::new(&device, &[])?;
         let camera = Camera::new(aspect_ratio);
+
         Ok(Self {
             device,
             swapchain,
@@ -63,6 +68,7 @@ impl Renderer {
             frag_uniform,
             render_targets,
             scene,
+            light_buffers,
             camera,
         })
     }
@@ -306,8 +312,7 @@ impl Renderer {
     pub fn resize(&mut self, window: &winit::window::Window) -> Result<()> {
         trace!("resizing");
         unsafe {
-            self.device
-                .handle
+            self.device.handle
                 .device_wait_idle()
                 .expect("failed waiting for idle device");
             self.render_targets.destroy(&self.device);
@@ -331,9 +336,8 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
-            self.device.handle
-                .device_wait_idle()
-                .expect("failed waiting for idle device");
+            self.device.handle.device_wait_idle().expect("failed waiting for idle device");
+            self.light_buffers.destroy(&self.device);
             self.uniform_buffers.destroy(&self.device);
             self.frame_queue.destroy(&self.device);
             self.render_targets.destroy(&self.device);
@@ -496,8 +500,7 @@ impl Device {
             .position(|(i, p)| {
                 p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
                     && unsafe {
-                        surface
-                            .loader
+                        surface.loader
                             .get_physical_device_surface_support(physical, i as u32, surface.handle)
                             .unwrap_or(false)
                     }
@@ -799,21 +802,19 @@ impl RenderPass {
                 .attachments(&attachments)
                 .subpasses(&subpasses)
                 .dependencies(&subpass_dependencies);
-
             device.handle.create_render_pass(&info, None)?
         };
 
-        let framebuffers: Result<Vec<_>> = render_targets
-            .targets
-            .iter()
-            .flat_map(|t| {
-                std::iter::repeat(t).take(swapchain.image_count() as usize)
-            })
+        let framebuffers: Result<Vec<_>> = render_targets.images
+            .chunks(FRAMES_IN_FLIGHT)
+            .flat_map(|t| iter::repeat(t).take(swapchain.image_count() as usize))
             .zip(swapchain.images.iter().cycle())
             .map(|(render_targets, swapchain_image)| {
                 let views = [
-                    render_targets.msaa.view,
-                    render_targets.depth.view,
+                    // MSAA image.
+                    render_targets[1].view,
+                    // Depth image.
+                    render_targets[0].view,
                     swapchain_image.view,
                 ];
                 let info = vk::FramebufferCreateInfo::builder()
@@ -822,7 +823,6 @@ impl RenderPass {
                     .width(swapchain.extent.width)
                     .height(swapchain.extent.height)
                     .layers(1);
-
                 Ok(unsafe { device.handle.create_framebuffer(&info, None)? })
             })
             .collect();
@@ -951,8 +951,7 @@ impl FrameQueue {
     ///
     /// Don't use `self` after calling this function.
     unsafe fn destroy(&self, device: &Device) {
-        let command_buffers: Vec<_> = self
-            .frames
+        let command_buffers: Vec<_> = self.frames
             .iter()
             .map(|frame| {
                 device.handle.destroy_semaphore(frame.rendered, None);
@@ -1079,14 +1078,16 @@ impl SwapchainImage {
     }
 }
 
-struct RenderTarget {
-    depth: Image,
-    msaa: Image,
-}
-
 pub struct RenderTargets {
-    targets: Vec<RenderTarget>,
-    block: MemoryBlock,
+    /// One depth and MSAA image per frame.
+    ///
+    /// | Frame | Image |
+    /// |-------|-------|
+    /// | 0     | depth |
+    /// | 0     | msaa  |
+    /// | 1     | depth |
+    /// | 1     | msaa  |
+    images: Images,
     sample_count: vk::SampleCountFlags,
 }
 
@@ -1159,26 +1160,14 @@ impl RenderTargets {
             .map(|info| *info)
             .take(FRAMES_IN_FLIGHT * 2)
             .collect();
-
         let images = Images::new(
             device,
             &image_infos,
             &view_infos,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
-
-        let targets = images.images
-            .as_slice()
-            .chunks(2)
-            .map(|images| RenderTarget {
-                depth: images[0].clone(),
-                msaa: images[1].clone(),
-            })
-            .collect();
-
         Ok(Self {
-            targets,
-            block: images.block,
+            images,
             sample_count,
         })
     }
@@ -1189,13 +1178,7 @@ impl RenderTargets {
     ///
     /// Don't use `self` after calling this function.
     unsafe fn destroy(&self, device: &Device) {
-        self.targets
-            .iter()
-            .for_each(|target| {
-                target.depth.destroy(device);
-                target.msaa.destroy(device);
-            });
-        self.block.free(device);
+        self.images.destroy(device);
     }
 }
 
@@ -1809,6 +1792,6 @@ unsafe extern "system" fn debug_callback(
 /// The number of frames being worked on concurrently. This could easily be higher, you could for
 /// instance work on all swapchain images concurrently, but you risk having the CPU run ahead,
 /// which add latency and delays. You also save some memory by having less depth buffers and such.
-const FRAMES_IN_FLIGHT: usize = 2;
+pub const FRAMES_IN_FLIGHT: usize = 2;
 
 const DEPTH_IMAGE_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
