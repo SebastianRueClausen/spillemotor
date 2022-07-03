@@ -1,16 +1,16 @@
 use anyhow::Result;
 use ash::extensions::{ext, khr};
 use ash::vk;
-use glam::{Vec3, Mat4};
+use glam::{Mat4, Vec3};
 
 use std::ffi::{self, CStr, CString};
 use std::path::Path;
 use std::{iter, mem};
 
 use crate::camera::Camera;
-use crate::resource::{Buffers, Images, MappedMemory};
-use crate::scene::{Scene, Vertex, SceneData, MaterialParams};
 use crate::light::{DirLight, LightBuffers};
+use crate::resource::{Buffers, Images, MappedMemory};
+use crate::scene::{MaterialParams, Scene, SceneData, Vertex};
 use crate::util;
 
 pub struct Renderer {
@@ -185,25 +185,17 @@ impl Renderer {
                             max_depth: 1.0,
                         }];
 
-                        self.device.handle.cmd_set_viewport(
-                            frame.command_buffer,
-                            0,
-                            &viewports,
-                        );
+                        self.device.handle.cmd_set_viewport(frame.command_buffer, 0, &viewports);
 
                         let scissors = [vk::Rect2D {
                             offset: vk::Offset2D { x: 0, y: 0 },
                             extent: self.swapchain.extent,
                         }];
 
-                        self.device.handle.cmd_set_scissor(
-                            frame.command_buffer,
-                            0,
-                            &scissors,
-                        );
+                        self.device.handle.cmd_set_scissor(frame.command_buffer, 0, &scissors);
 
-                        let descriptor =
-                            material.pipeline.descriptor_sets[self.frame_queue.frame_index as usize];
+                        let descriptor = material.pipeline.descriptor_sets
+                            [self.frame_queue.frame_index as usize];
 
                         self.device.handle.cmd_bind_descriptor_sets(
                             frame.command_buffer,
@@ -257,7 +249,9 @@ impl Renderer {
                     }
 
                     self.device.handle.cmd_end_render_pass(frame.command_buffer);
-                    self.device.handle.end_command_buffer(frame.command_buffer)?;
+                    self.device
+                        .handle
+                        .end_command_buffer(frame.command_buffer)?;
                 }
 
                 // Submit command buffer to be rendered. Wait for semaphore `frame.presented` first and
@@ -312,7 +306,8 @@ impl Renderer {
     pub fn resize(&mut self, window: &winit::window::Window) -> Result<()> {
         trace!("resizing");
         unsafe {
-            self.device.handle
+            self.device
+                .handle
                 .device_wait_idle()
                 .expect("failed waiting for idle device");
             self.render_targets.destroy(&self.device);
@@ -336,7 +331,10 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
-            self.device.handle.device_wait_idle().expect("failed waiting for idle device");
+            self.device
+                .handle
+                .device_wait_idle()
+                .expect("failed waiting for idle device");
             self.light_buffers.destroy(&self.device);
             self.uniform_buffers.destroy(&self.device);
             self.frame_queue.destroy(&self.device);
@@ -396,7 +394,7 @@ impl Device {
         };
 
         let validation_layer = CString::new("VK_LAYER_KHRONOS_validation").unwrap();
-        let layer_names = [ validation_layer.as_ptr() ];
+        let layer_names = [validation_layer.as_ptr()];
 
         let version = vk::make_api_version(0, 1, 0, 0);
 
@@ -414,18 +412,14 @@ impl Device {
             let ext_names = [
                 ext::DebugUtils::name().as_ptr(),
                 khr::Surface::name().as_ptr(),
-
                 #[cfg(target_os = "linux")]
                 khr::WaylandSurface::name().as_ptr(),
-
                 #[cfg(target_os = "macos")]
                 ext::MetalSurface::name().as_ptr(),
-
                 #[cfg(target_os = "macos")]
                 vk::KhrPortabilityEnumerationFn::name().as_ptr(),
-
                 #[cfg(target_os = "macos")]
-                vk::KhrGetPhysicalDeviceProperties2Fn::name().as_ptr()
+                vk::KhrGetPhysicalDeviceProperties2Fn::name().as_ptr(),
             ];
 
             let flags = if cfg!(target_os = "macos") {
@@ -436,9 +430,9 @@ impl Device {
 
             /*
             let mut validation_features = vk::ValidationFeaturesEXT::builder()
-                .enabled_validation_features(&[vk::ValidationFeatureEnableEXT::DEBUG_PRINTF]); 
+                .enabled_validation_features(&[vk::ValidationFeatureEnableEXT::DEBUG_PRINTF]);
             */
-            
+
             let info = vk::InstanceCreateInfo::builder()
                 .flags(flags)
                 .push_next(&mut debug_info)
@@ -468,12 +462,19 @@ impl Device {
 
                     trace!("device candicate: {name}");
 
-                    let mut score = 0;
+                    let mut score = properties.limits.max_image_dimension2_d;
+
                     if properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
                         score += 1000;
                     }
 
-                    score += properties.limits.max_image_dimension2_d;
+                    if properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU {
+                        score += 500;
+                    }
+
+                    if properties.device_type == vk::PhysicalDeviceType::CPU {
+                        score = 0;
+                    }
 
                     score
                 })
@@ -500,7 +501,8 @@ impl Device {
             .position(|(i, p)| {
                 p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
                     && unsafe {
-                        surface.loader
+                        surface
+                            .loader
                             .get_physical_device_surface_support(physical, i as u32, surface.handle)
                             .unwrap_or(false)
                     }
@@ -530,7 +532,6 @@ impl Device {
         let extensions = [
             khr::Swapchain::name().as_ptr(),
             // vk::KhrShaderNonSemanticInfoFn::name().as_ptr(),
-
             #[cfg(target_os = "macos")]
             vk::KhrPortabilitySubsetFn::name().as_ptr(),
         ];
@@ -619,7 +620,8 @@ impl Device {
                 vk::Fence::null(),
             )?;
             self.handle.queue_wait_idle(self.transfer_queue.handle)?;
-            self.handle.free_command_buffers(self.transfer_pool, &buffers);
+            self.handle
+                .free_command_buffers(self.transfer_pool, &buffers);
         }
 
         Ok(())
@@ -628,7 +630,10 @@ impl Device {
     /// Get the sample count for msaa. For now it just the highest sample count the device
     /// supports, but below 8 samples.
     fn sample_count(&self) -> vk::SampleCountFlags {
-        let counts = self.device_properties.limits.framebuffer_depth_sample_counts;
+        let counts = self
+            .device_properties
+            .limits
+            .framebuffer_depth_sample_counts;
 
         // We don't wan't more than 8.
         let types = [
@@ -636,7 +641,7 @@ impl Device {
             vk::SampleCountFlags::TYPE_4,
             vk::SampleCountFlags::TYPE_2,
         ];
-        
+
         for t in types {
             if counts.contains(t) {
                 return t;
@@ -700,7 +705,7 @@ pub struct RenderPass {
     ///
     /// Alternatively you could either have a render attachments for each swapchain image, or
     /// create a new framebuffer dynamically before each frame. They both have disadvanges however.
-    /// 
+    ///
     /// Some graphics cards gives up to 5 swapchain images it seems, so having 5 depth images and
     /// msaa images is be somewhat wasteful considering we only use `FRAMES_IN_FLIGHT` at a time.
     ///
@@ -805,7 +810,8 @@ impl RenderPass {
             device.handle.create_render_pass(&info, None)?
         };
 
-        let framebuffers: Result<Vec<_>> = render_targets.images
+        let framebuffers: Result<Vec<_>> = render_targets
+            .images
             .chunks(FRAMES_IN_FLIGHT)
             .flat_map(|t| iter::repeat(t).take(swapchain.image_count() as usize))
             .zip(swapchain.images.iter().cycle())
@@ -922,7 +928,8 @@ impl FrameQueue {
             let command_buffer_info = vk::CommandBufferAllocateInfo::builder()
                 .command_pool(device.graphics_pool)
                 .command_buffer_count(FRAMES_IN_FLIGHT as u32);
-            device.handle
+            device
+                .handle
                 .allocate_command_buffers(&command_buffer_info)?
         };
 
@@ -951,7 +958,8 @@ impl FrameQueue {
     ///
     /// Don't use `self` after calling this function.
     unsafe fn destroy(&self, device: &Device) {
-        let command_buffers: Vec<_> = self.frames
+        let command_buffers: Vec<_> = self
+            .frames
             .iter()
             .map(|frame| {
                 device.handle.destroy_semaphore(frame.rendered, None);
@@ -990,7 +998,7 @@ impl Surface {
                     .display(handle.display)
                     .surface(handle.surface);
                 let loader = khr::WaylandSurface::new(entry, instance);
-                loader.create_wayland_surface(&info, None)
+                unsafe { loader.create_wayland_surface(&info, None) }
             }
 
             #[cfg(target_os = "linux")]
@@ -999,7 +1007,7 @@ impl Surface {
                     .dpy(handle.display as *mut _)
                     .window(handle.window);
                 let loader = khr::XlibSurface::new(entry, instance);
-                loader.create_xlib_surface(&info, None)
+                unsafe { loader.create_xlib_surface(&info, None) }
             }
 
             #[cfg(target_os = "linux")]
@@ -1008,7 +1016,7 @@ impl Surface {
                     .connection(handle.connection)
                     .window(handle.window);
                 let loader = khr::XcbSurface::new(entry, instance);
-                loader.create_xcb_surface(&info, None)
+                unsafe { loader.create_xcb_surface(&info, None) }
             }
 
             #[cfg(target_os = "macos")]
@@ -1027,17 +1035,15 @@ impl Surface {
                 let loader = ext::MetalSurface::new(entry, instance);
 
                 loader.create_metal_surface(&info, None)
-            }
+            },
 
             _ => {
                 return Err(anyhow!("unsupported platform"));
             }
         };
 
-        let handle = handle?;
-
         Ok(Self {
-            handle,
+            handle: handle?,
             loader,
         })
     }
@@ -1127,8 +1133,9 @@ impl RenderTargets {
             .subresource_range(depth_subresource_info);
         let msaa_image_info = vk::ImageCreateInfo::builder()
             .image_type(vk::ImageType::TYPE_2D)
-            .usage(vk::ImageUsageFlags::TRANSIENT_ATTACHMENT
-                | vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .usage(
+                vk::ImageUsageFlags::TRANSIENT_ATTACHMENT | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            )
             .format(swapchain.surface_format.format)
             .tiling(vk::ImageTiling::OPTIMAL)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -1198,14 +1205,20 @@ impl Swapchain {
     /// if it aren't able to determine it from `surface`.
     pub fn new(device: &Device, extent: vk::Extent2D) -> Result<Self> {
         let (surface_formats, _present_modes, surface_caps) = unsafe {
-            let format = device.surface.loader
+            let format = device
+                .surface
+                .loader
                 .get_physical_device_surface_formats(device.physical, device.surface.handle)?;
-            let modes = device.surface.loader
+            let modes = device
+                .surface
+                .loader
                 .get_physical_device_surface_present_modes(
                     device.physical,
                     device.surface.handle,
                 )?;
-            let caps = device.surface.loader
+            let caps = device
+                .surface
+                .loader
                 .get_physical_device_surface_capabilities(device.physical, device.surface.handle)?;
             (format, modes, caps)
         };
@@ -1288,7 +1301,9 @@ impl Swapchain {
         }
 
         let surface_caps = unsafe {
-            device.surface.loader
+            device
+                .surface
+                .loader
                 .get_physical_device_surface_capabilities(device.physical, device.surface.handle)?
         };
 
@@ -1439,7 +1454,10 @@ impl UniformBuffers {
             let vert_buf = &self.buffers[frame_index * 2];
             let frag_buf = &self.buffers[frame_index * 2 + 1];
 
-            (self.mapped.get_range(&vert_buf.range), self.mapped.get_range(&frag_buf.range))
+            (
+                self.mapped.get_range(&vert_buf.range),
+                self.mapped.get_range(&frag_buf.range),
+            )
         };
 
         vert_mem.copy_from_slice(util::bytes_of(vert));
@@ -1492,10 +1510,12 @@ impl Pipeline {
         texture_sampler: vk::Sampler,
     ) -> Result<Self> {
         let vertex_module = create_shader_module(
-            &device, include_bytes_aligned_as!(u32, "../shaders/vert.spv"),
+            &device,
+            include_bytes_aligned_as!(u32, "../shaders/vert.spv"),
         )?;
         let fragment_module = create_shader_module(
-            &device, include_bytes_aligned_as!(u32, "../shaders/frag.spv"),
+            &device,
+            include_bytes_aligned_as!(u32, "../shaders/frag.spv"),
         )?;
 
         let entry = CString::new("main").unwrap();
@@ -1590,7 +1610,9 @@ impl Pipeline {
             let layout_info =
                 vk::DescriptorSetLayoutCreateInfo::builder().bindings(&layout_bindings);
 
-            device.handle.create_descriptor_set_layout(&layout_info, None)?
+            device
+                .handle
+                .create_descriptor_set_layout(&layout_info, None)?
         };
 
         let descriptor_sets = unsafe {
@@ -1601,7 +1623,10 @@ impl Pipeline {
             device.handle.allocate_descriptor_sets(&alloc_info)?
         };
 
-        for (set, buffers) in descriptor_sets.iter().zip(uniform_buffers.buffers.chunks(2)) {
+        for (set, buffers) in descriptor_sets
+            .iter()
+            .zip(uniform_buffers.buffers.chunks(2))
+        {
             let vert_infos = [vk::DescriptorBufferInfo {
                 buffer: buffers[0].handle,
                 offset: 0,
@@ -1709,8 +1734,8 @@ impl Pipeline {
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state = vk::PipelineDynamicStateCreateInfo::builder()
-            .dynamic_states(&dynamic_states);
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_states);
         let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
             .dynamic_state(&dynamic_state)
             .stages(&shader_stages)
