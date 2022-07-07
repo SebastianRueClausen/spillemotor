@@ -88,7 +88,7 @@ fn main() -> Result<()> {
             }
         }
         Event::MainEventsCleared => {
-            renderer.camera.update(&mut input_state, last_update.elapsed());
+            renderer.scene.update(&mut input_state, last_update.elapsed());
             last_update = Instant::now();
 
             if let Some(left) = Duration::from_millis(16).checked_sub(last_draw.elapsed()) {

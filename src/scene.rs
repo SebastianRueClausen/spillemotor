@@ -5,9 +5,14 @@ use ash::vk;
 use std::{fs, io, mem};
 use std::path::{PathBuf, Path};
 use std::ops::Index;
+use std::time::Duration;
 
 use crate::util;
-use crate::core::{Device, Swapchain, RenderPass, RenderTargets, UniformBuffers, Pipeline};
+use crate::camera::{InputState, Camera};
+use crate::light::{PointLight, Lights};
+use crate::core::{Device, Swapchain, RenderPass, RenderTargets, Pipeline};
+use crate::core::{DescriptorSet, DescriptorBinding, BindingKind};
+use crate::core::{VertUniform, FragUniform, UniformBuffers};
 use crate::resource::{Images, Buffers};
 
 #[repr(C)]
@@ -77,6 +82,7 @@ unsafe impl util::Pod for MaterialParams {}
 pub struct Material {
     pub base_color: usize,
     pub pipeline: Pipeline,
+    pub descriptor: DescriptorSet,
     pub params: MaterialParams,
 }
 
@@ -88,6 +94,7 @@ impl Material {
     /// Don't use `self` after calling this function.
     pub unsafe fn destroy(&self, device: &Device) {
         self.pipeline.destroy(device);
+        self.descriptor.destroy(device);
     }
 }
 
@@ -121,6 +128,15 @@ impl Materials {
 }
 
 pub struct Scene {
+    lights: Lights,
+    camera: Camera,
+
+    vert_uniform: VertUniform,
+    frag_uniform: FragUniform,
+    uniform_buffers: UniformBuffers,
+
+    pub light_descriptor: DescriptorSet,
+
     pub materials: Materials,
     pub models: Models,
 }
@@ -131,9 +147,26 @@ impl Scene {
         swapchain: &Swapchain,
         render_pass: &RenderPass,
         render_targets: &RenderTargets,
-        uniform_buffers: &UniformBuffers,
         scene_data: &SceneData,
     ) -> Result<Self> {
+        let camera = Camera::new(swapchain.aspect_ratio());
+        let lights = Lights::new(device, &camera, &swapchain, &[
+            PointLight::new(
+                Vec3::new(110.0, 45.0, -24.0),
+                Vec3::splat(32000.0),
+                10.0,
+            ),
+            PointLight::new(
+                Vec3::new(30.0, 55.0, -59.0),
+                Vec3::splat(32000.0),
+                10.0,
+            ),
+        ])?;
+
+        let uniform_buffers = UniformBuffers::new(&device)?;
+        let vert_uniform = VertUniform::default();
+        let frag_uniform = FragUniform::default();
+
         let staging = {
             let create_infos: Vec<_> = scene_data.meshes
                 .iter()
@@ -163,7 +196,7 @@ impl Scene {
             .flat_map(|mesh| [mesh.verts.as_slice(), mesh.indices.as_slice()])
             .zip(staging.buffers.iter())
             .for_each(|(src, dst)| unsafe {
-                mapped.get_range(&dst.range).copy_from_slice(&src);
+                mapped.get_range(dst.range.clone()).copy_from_slice(&src);
             });
 
         staging.block.unmap(device, mapped);
@@ -193,7 +226,7 @@ impl Scene {
             Buffers::new(device, &create_infos, vk::MemoryPropertyFlags::DEVICE_LOCAL, 4)?
         };
 
-        device.transfer(|command_buffer| {
+        device.transfer_with(|command_buffer| {
             for (src, dst) in staging.iter().zip(buffers.iter()) {
                 assert_eq!(src.size(), dst.size());
 
@@ -239,7 +272,7 @@ impl Scene {
             .map(|mat| mat.base_color.data.as_slice())
             .zip(staging.iter())
             .for_each(|(src, dst)| unsafe {
-                mapped.get_range(&dst.range).copy_from_slice(&src);
+                mapped.get_range(dst.range.clone()).copy_from_slice(&src);
             });
 
         staging.block.unmap(device, mapped);
@@ -292,7 +325,7 @@ impl Scene {
             image.transition_layout(device, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
         }
 
-        device.transfer(|command_buffer| {
+        device.transfer_with(|command_buffer| {
             for (src, dst) in staging.iter().zip(images.iter()) {
                 // I think they should be the same size, but in some instance they aren't for some
                 // reason. Vulkan doesn't complain so i guess it's is alright.
@@ -343,25 +376,83 @@ impl Scene {
             })
             .collect();
 
-        let sampler = create_texture_sampler(device)?;
+        let light_descriptor = DescriptorSet::new(device, &[
+            DescriptorBinding {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                stage: vk::ShaderStageFlags::FRAGMENT,
+                kind: BindingKind::Buffer([
+                    &lights.general_data_buffer.buffer, 
+                    &lights.general_data_buffer.buffer, 
+                ]),
+            },
+            DescriptorBinding {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                stage: vk::ShaderStageFlags::FRAGMENT,
+                kind: BindingKind::Buffer([
+                    lights.light_buffer(), 
+                    lights.light_buffer(), 
+                ]),
+            },
+            DescriptorBinding {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                stage: vk::ShaderStageFlags::FRAGMENT,
+                kind: BindingKind::Buffer([
+                    lights.active_lights_buffer(0), 
+                    lights.active_lights_buffer(1), 
+                ]),
+            },
+            DescriptorBinding {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                stage: vk::ShaderStageFlags::FRAGMENT,
+                kind: BindingKind::Buffer([
+                    lights.cluster_lights_buffer(0), 
+                    lights.cluster_lights_buffer(1), 
+                ]),
+            },
+        ])?;
 
+        let sampler = create_texture_sampler(device)?;
         let materials: Result<Vec<_>> = scene_data.materials
             .iter()
             .enumerate()
             .map(|(base_color, mat)| {
-                let view = images[base_color].view;
+                let base = &images[base_color];
+                let descriptor = DescriptorSet::new(device, &[
+                    DescriptorBinding {
+                        ty: vk::DescriptorType::UNIFORM_BUFFER,
+                        stage: vk::ShaderStageFlags::VERTEX,
+                        kind: BindingKind::Buffer([
+                            uniform_buffers.get_vert(0),
+                            uniform_buffers.get_vert(1),
+                        ]),
+                    },
+                    DescriptorBinding {
+                        ty: vk::DescriptorType::UNIFORM_BUFFER,
+                        stage: vk::ShaderStageFlags::FRAGMENT,
+                        kind: BindingKind::Buffer([
+                            uniform_buffers.get_frag(0),
+                            uniform_buffers.get_frag(1),
+                        ]),
+                    },
+                    DescriptorBinding {
+                        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        stage: vk::ShaderStageFlags::FRAGMENT,
+                        kind: BindingKind::Image(sampler, [base; 2]),
+                    },
+                ])?;
+
                 let pipeline = Pipeline::new_render(
                     device,
                     swapchain,
                     render_pass,
                     render_targets,
-                    uniform_buffers,
-                    view,
-                    sampler,            
+                    &[&descriptor, &light_descriptor],
                 )?;
+
                 Ok(Material {
                     base_color,
                     pipeline,
+                    descriptor,
                     params: MaterialParams {
                         metallic: mat.metallic,
                         roughness: mat.roughness,
@@ -373,6 +464,12 @@ impl Scene {
         let materials = materials?;
 
         Ok(Self {
+            camera,
+            lights,
+            light_descriptor,
+            vert_uniform,
+            frag_uniform,
+            uniform_buffers,
             models: Models {
                 buffers,
                 models,
@@ -385,12 +482,35 @@ impl Scene {
         })
     }
 
+    pub fn update(&mut self, input_state: &mut InputState, dt: Duration) {
+        self.camera.update(input_state, dt); 
+    }
+
+    pub fn handle_resize(&mut self, swapchain: &Swapchain) {
+        self.camera.update_perspective(swapchain.aspect_ratio());
+        self.lights.handle_resize(&self.camera, swapchain); 
+    }
+
+    pub fn upload_data(&mut self, frame_index: usize) {
+        self.vert_uniform.update(&self.camera);
+        self.frag_uniform.update(&self.camera);
+
+        self.uniform_buffers.upload_data(
+            frame_index,
+            &self.vert_uniform,
+            &self.frag_uniform,
+        );
+    }
+
     /// Destroy and leave `self` in an invalid state.
     ///
     /// # Safety
     ///
     /// Don't use `self` after calling this function.
     pub unsafe fn destroy(&self, device: &Device) {
+        self.lights.destroy(device);
+        self.light_descriptor.destroy(device);
+        self.uniform_buffers.destroy(device);
         self.materials.destroy(device);
         self.models.destroy(device);
     }

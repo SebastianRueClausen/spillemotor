@@ -1,13 +1,12 @@
 use anyhow::Result;
 use ash::vk;
 
-use std::ops::{Index, Range};
-use std::mem;
+use std::{mem, ops};
 
 use crate::core::Device;
 use crate::util;
 
-type MemoryRange = Range<vk::DeviceSize>;
+type MemoryRange = ops::Range<vk::DeviceSize>;
 
 /// A wrapper around a raw ptr into a mapped memory block.
 ///
@@ -31,7 +30,15 @@ impl MappedMemory {
         let Some(ptr) = self.as_ptr() else {
             return None;
         };
-        Some(std::slice::from_raw_parts_mut(ptr, self.size as usize / std::mem::size_of::<T>()))
+
+        if mem::size_of::<T>() == 0 {
+            panic!("`T` has size of 0");
+        }
+
+        Some(std::slice::from_raw_parts_mut(
+            ptr,
+            self.size as usize / std::mem::size_of::<T>(),
+        ))
     }
 
     /// Get the mapped pointer as an abitrary type.
@@ -46,12 +53,25 @@ impl MappedMemory {
 
     /// Get slice of memory in a `range` relative from the start of the buffer.
     ///
-    /// # Panic
+    /// # Panics
     ///
     /// If the range isn't contained in the mapped memory.
-    pub unsafe fn get_range(&self, range: &MemoryRange) -> &mut [u8] {
-        let start = range.start as usize;
-        let end = range.end as usize;
+    #[inline]
+    pub unsafe fn get_range(&self, range: impl ops::RangeBounds<vk::DeviceSize>) -> &mut [u8] {
+        let start = match range.start_bound() {
+            ops::Bound::Included(&start) => start,
+            ops::Bound::Excluded(start) => start - 1,
+            ops::Bound::Unbounded => 0,
+        };
+
+        let end = match range.end_bound() {
+            ops::Bound::Included(&end) => end - 1,
+            ops::Bound::Excluded(end) => *end,
+            ops::Bound::Unbounded => self.size,
+        };
+
+        let start = start as usize;
+        let end = end as usize;
 
         // `as_slice` will only fail if the type isn't aligned with `ptr`, this will never fail for
         // `u8`.
@@ -62,11 +82,13 @@ impl MappedMemory {
     }
 }
 
-/// A block of device memory.
+/// A untyped block of raw device memory.
 pub struct MemoryBlock {
     handle: vk::DeviceMemory,
+
     #[allow(dead_code)]
     properties: vk::MemoryPropertyFlags,
+
     size: vk::DeviceSize,
 }
 
@@ -87,13 +109,14 @@ impl MemoryBlock {
         })
     }
 
-    /// Bind `buffer` to a slice of the memory owned by `self. The memory range is determined by
-    /// `buffer` and the function will fail if that range goes past the end of the memory block.
-    pub fn bind_buffer(&self, device: &Device, buffer: &BufferView) -> Result<()> {
+    /// Bind [`BufferView`] to a slice of the memory owned by `self. The memory range is determined
+    /// by `buffer` and the function will fail if that range goes past the end of the memory block.
+    pub fn bind_buffer_view(&self, device: &Device, buffer: &BufferView) -> Result<()> {
         unsafe {
-            device.handle.bind_buffer_memory(buffer.handle, self.handle, buffer.range.start)?;
+            device
+                .handle
+                .bind_buffer_memory(buffer.handle, self.handle, buffer.range.start)?;
         }
-
         Ok(())
     }
 
@@ -102,7 +125,8 @@ impl MemoryBlock {
     pub fn map(&self, device: &Device) -> Result<MappedMemory> {
         let ptr = unsafe {
             let flags = vk::MemoryMapFlags::empty();
-            device.handle
+            device
+                .handle
                 .map_memory(self.handle, 0, self.size, flags)
                 .map(|ptr| ptr as *mut u8)?
         };
@@ -112,11 +136,26 @@ impl MemoryBlock {
         })
     }
 
+    /// Map the block and let `func` use the mapped memory. After the `func` is called, the memory
+    /// is unmaped.
+    pub fn map_with<F, R>(&self, device: &Device, func: F) -> Result<R>
+    where
+        F: FnOnce(&MappedMemory) -> R,
+    {
+        self.map(device).map(|mapped| {
+            let ret = func(&mapped);
+            self.unmap(device, mapped);
+            ret
+        })
+    }
+
     /// Unmap the the memory of self. It must consume a [`MappedMemory`] object to both insure that
     /// the memory is current mapped, and to insure said mapped memory isn't used after calling
     /// this.
     pub fn unmap(&self, device: &Device, _mapped: MappedMemory) {
-        unsafe { device.handle.unmap_memory(self.handle); }
+        unsafe {
+            device.handle.unmap_memory(self.handle);
+        }
     }
 
     /// Free the memory and leave `self` in an invalid state. This leaves any [`MappedMemory`]
@@ -128,6 +167,79 @@ impl MemoryBlock {
     /// function.
     pub unsafe fn free(&self, device: &Device) {
         device.handle.free_memory(self.handle, None);
+    }
+}
+
+/// A single buffer which holds it's own memory.
+pub struct Buffer {
+    pub view: BufferView,
+    pub block: MemoryBlock,
+}
+
+impl ops::Deref for Buffer {
+    type Target = BufferView;
+
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+
+impl Buffer {
+    pub fn new(
+        device: &Device,
+        info: &vk::BufferCreateInfo,
+        memory_flags: vk::MemoryPropertyFlags,
+    ) -> Result<Self> {
+        let handle = unsafe { device.handle.create_buffer(info, None)? };
+        let req = unsafe { device.handle.get_buffer_memory_requirements(handle) };
+
+        let memory_type = memory_type_index(
+            &device.memory_properties,
+            memory_flags,
+            req.memory_type_bits,
+        )
+        .ok_or_else(|| anyhow!("no compatible memory type"))?;
+
+        let mut alloc_info = vk::MemoryAllocateInfo::builder()
+            .allocation_size(req.size)
+            .memory_type_index(memory_type);
+        let mut alloc_flags = vk::MemoryAllocateFlagsInfo::builder();
+
+        if info
+            .usage
+            .contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+        {
+            alloc_flags = alloc_flags
+                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS_KHR)
+                .device_mask(1);
+            alloc_info = alloc_info.push_next(&mut alloc_flags);
+        }
+
+        let block = MemoryBlock::allocate(device, memory_flags, &alloc_info)?;
+        unsafe {
+            device.handle.bind_buffer_memory(handle, block.handle, 0)?;
+        }
+
+        let view = BufferView {
+            handle,
+            range: 0..block.size,
+        };
+
+        Ok(Self { view, block })
+    }
+
+    pub fn size(&self) -> vk::DeviceSize {
+        self.view.size()
+    }
+
+    /// Destroy the buffer and free the memory.
+    ///
+    /// # Safety
+    ///
+    /// Don't use `self` after calling this function.
+    pub unsafe fn destroy(&self, device: &Device) {
+        self.view.destroy(device);
+        self.block.free(device);
     }
 }
 
@@ -181,7 +293,7 @@ pub struct Buffers {
     pub buffers: Vec<BufferView>,
 }
 
-impl Index<usize> for Buffers {
+impl ops::Index<usize> for Buffers {
     type Output = BufferView;
 
     fn index(&self, idx: usize) -> &Self::Output {
@@ -192,6 +304,7 @@ impl Index<usize> for Buffers {
 impl Buffers {
     /// Buffers are often stored in chunks of the same size. This is an easy way to iterate over
     /// said chunks.
+    #[allow(unused)]
     pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = &[BufferView]> {
         self.buffers.as_slice().chunks(chunk_size)
     }
@@ -252,9 +365,10 @@ impl Buffers {
             .memory_type_index(memory_type);
 
         let mut flags = vk::MemoryAllocateFlagsInfo::builder();
-        if create_infos.iter().any(|info|
-            info.usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
-        ) {
+        if create_infos.iter().any(|info| {
+            info.usage
+                .contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+        }) {
             flags = flags
                 .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS_KHR)
                 .device_mask(1);
@@ -264,7 +378,7 @@ impl Buffers {
         let block = MemoryBlock::allocate(device, memory_flags, &alloc_info)?;
 
         for buffer in &buffers {
-            block.bind_buffer(device, &buffer)?;
+            block.bind_buffer_view(device, &buffer)?;
         }
 
         Ok(Self { buffers, block })
@@ -293,7 +407,7 @@ impl Buffers {
 /// Don't use the buffer after destroying the owning [`Images`] object or deallocating the
 /// [`MemoryBlock`].
 #[derive(Clone)]
-pub struct ImageView {
+pub struct Image {
     pub handle: vk::Image,
     pub view: vk::ImageView,
     pub layout: vk::ImageLayout,
@@ -302,7 +416,7 @@ pub struct ImageView {
     pub range: MemoryRange,
 }
 
-impl ImageView {
+impl Image {
     /// The size of the image in bytes.
     pub fn size(&self) -> vk::DeviceSize {
         self.range.end - self.range.start
@@ -319,7 +433,7 @@ impl ImageView {
     ///
     /// The transition will fail if the transfer doesn't fit into the tabel.
     pub fn transition_layout(&mut self, device: &Device, new: vk::ImageLayout) -> Result<()> {
-        device.transfer(|cmd| {
+        device.transfer_with(|cmd| {
             let subresource = vk::ImageSubresourceRange::builder()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .base_mip_level(0)
@@ -340,17 +454,26 @@ impl ImageView {
                     barrier = barrier
                         .src_access_mask(vk::AccessFlags::empty())
                         .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-                    (vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER)
+                    (
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                    )
                 }
-                (vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => {
+                (
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ) => {
                     barrier = barrier
                         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                         .dst_access_mask(vk::AccessFlags::SHADER_READ);
-                    (vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER)
+                    (
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    )
                 }
                 _ => {
-                    todo!()  
-                },
+                    todo!()
+                }
             };
 
             self.layout = new;
@@ -385,12 +508,12 @@ impl ImageView {
 
 /// An aggregate collection of images all located in a single memory block.
 pub struct Images {
-    pub images: Vec<ImageView>,
+    pub images: Vec<Image>,
     pub block: MemoryBlock,
 }
 
-impl Index<usize> for Images {
-    type Output = ImageView;
+impl ops::Index<usize> for Images {
+    type Output = Image;
 
     fn index(&self, idx: usize) -> &Self::Output {
         &self.images[idx]
@@ -398,13 +521,13 @@ impl Index<usize> for Images {
 }
 
 impl Images {
-    pub fn iter(&self) -> impl Iterator<Item = &ImageView> {
+    pub fn iter(&self) -> impl Iterator<Item = &Image> {
         self.images.iter()
     }
 
     /// Images are often stored in chunks of the same size. This is an easy way to iterate over
     /// said chunks.
-    pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = &[ImageView]> {
+    pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = &[Image]> {
         self.images.as_slice().chunks(chunk_size)
     }
 
@@ -447,7 +570,7 @@ impl Images {
                 memory_type_bits &= requirements.memory_type_bits;
                 current_size = end;
 
-                Ok(ImageView {
+                Ok(Image {
                     handle,
                     extent: image_info.extent,
                     layout: image_info.initial_layout,
@@ -473,7 +596,9 @@ impl Images {
 
         for (image, view_info) in images.iter_mut().zip(view_infos.iter()) {
             image.view = unsafe {
-                device.handle.bind_image_memory(image.handle, block.handle, image.range.start)?;
+                device
+                    .handle
+                    .bind_image_memory(image.handle, block.handle, image.range.start)?;
 
                 let mut info = view_info.clone();
                 info.image = image.handle;

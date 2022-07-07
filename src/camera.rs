@@ -115,12 +115,15 @@ impl Camera {
         if input_state.is_key_pressed(VirtualKeyCode::W) {
             self.pos += self.front * speed;
         }
+
         if input_state.is_key_pressed(VirtualKeyCode::S) {
             self.pos -= self.front * speed;
         }
+
         if input_state.is_key_pressed(VirtualKeyCode::A) {
             self.pos -= self.front.cross(self.up).normalize() * speed;
         }
+
         if input_state.is_key_pressed(VirtualKeyCode::D) {
             self.pos += self.front.cross(self.up).normalize() * speed;
         }
@@ -129,7 +132,6 @@ impl Camera {
        
         self.yaw -= x_delta as f32 * self.rotation_speed;
         self.pitch += y_delta as f32 * self.rotation_speed;
-
         self.pitch = self.pitch.clamp(-89.0, 89.0);
 
         self.front = -Vec3::new(

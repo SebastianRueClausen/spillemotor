@@ -11,19 +11,47 @@ struct DirLight {
 struct PointLight {
 	vec3 pos;
 	vec3 lum;
+	float radius;
 };
 
-layout (set = 0, binding = 1) uniform UniformBufferObject { 
+struct ClusterLights {
+	uint count;
+	uint off;
+};
+
+layout (set = 0, binding = 1) uniform Ubo { 
 	DirLight dir_light;
 	vec3 camera_pos;
 } ubo;
+
+layout (set = 0, binding = 2) uniform sampler2D tex_sampler;
+
+readonly layout (std140, set = 1, binding = 0) buffer LightGeneral {
+	mat4 inv_perspective;
+	uvec2 screen_extent;
+	uvec3 cluster_grid;
+} light_general;
+
+readonly layout (std140, set = 1, binding = 1) buffer LightBuffer {
+	uint count;
+	uint capacity;
+	PointLight lights[];
+} light_buffer;
+
+/*
+readonly layout (set = 1, binding = 2) buffer ActiveLights {
+	uint active_lights[8 * 4 * 8 * 128];
+} active_lights;
+
+readonly layout (set = 1, binding = 3) buffer ClusterLights {
+	ClusterLights active_lights[128];
+} cluster_lights;
+*/
 
 layout (push_constant) uniform PushConstant {
 	layout(offset = 64) float roughness;
 	layout(offset = 68) float metallic;
 } pc;
-
-layout (set = 0, binding = 2) uniform sampler2D tex_sampler;
 
 layout (location = 0) in vec2 in_texcoord;
 layout (location = 1) in vec3 in_normal;
@@ -88,38 +116,6 @@ vec3 brdf(
 	return (diffuse + specular) * irradiance * normal_dot_light;
 }
 
-// Calculate the radiance from a directional light.
-//
-// `albedo` is the amount of light the surface reflects, i.e. the base color. `view_dir` is the
-// direction to the light in world space. `f0` is the reflectance from the normal angle.
-vec3 dir_light_radiance(
-	DirLight light,
-	vec3 albedo,
-	vec3 normal,
-	vec3 view_dir,
-	float roughness,
-	float metallic,
-	vec3 f0
-) {
-	return brdf(albedo, normal, view_dir, light.dir, light.irradiance, roughness, metallic, f0);
-}
-
-vec3 point_light_radiance(
-	PointLight light,
-	vec3 albedo,
-	vec3 normal,
-	vec3 view_dir,
-	vec3 pos,
-	float roughness,
-	float metallic,
-	vec3 f0
-) {
-	vec3 light_dir = normalize(light.pos - pos);
-	float dist = length(light.pos - pos);
-	vec3 irradiance = light.lum / (4.0 * PI * dist * dist);
-	return brdf(albedo, normal, view_dir, light_dir, irradiance, roughness, metallic, f0);
-}
-
 void main() {
 	vec4 color = texture(tex_sampler, in_texcoord);
 	vec3 view_dir = normalize(ubo.camera_pos - in_ws_pos);
@@ -138,14 +134,24 @@ void main() {
 	// Reflectance at normal incidence.	
 	vec3 f0 = mix(vec3(0.04), albedo, metallic);
 
-	vec3 radiance = dir_light_radiance(ubo.dir_light, albedo, normal, view_dir, roughness, metallic, f0);
-
-	PointLight pl = PointLight(
-		vec3(110.0, 45.0, -24.0), 
-		vec3(32000.0, 32000.0, 32000.0)
+	vec3 radiance = brdf(
+		albedo,
+		normal,
+		view_dir,
+		ubo.dir_light.dir,
+		ubo.dir_light.irradiance,
+		roughness,
+		metallic,
+		f0
 	);
 
-	radiance += point_light_radiance(pl, albedo, normal, view_dir, in_ws_pos, roughness, metallic, f0);
+	for (uint i = 0; i < light_buffer.count; i += 1) {
+		PointLight light = light_buffer.lights[i];
+		vec3 light_dir = normalize(light.pos - in_ws_pos);
+		float dist = length(light.pos - in_ws_pos);
+		vec3 irradiance = light.lum / (4.0 * PI * dist * dist);
+		radiance += brdf(albedo, normal, view_dir, light_dir, irradiance, roughness, metallic, f0);
+	}
 
 	vec3 ambient = vec3(0.040) * albedo;
 
