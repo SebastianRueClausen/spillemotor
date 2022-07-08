@@ -11,8 +11,8 @@ use std::{iter, mem, ops};
 use crate::camera::Camera;
 use crate::light::DirLight;
 use crate::resource::{Buffers, BufferView, Image, Images, MappedMemory};
-use crate::scene::{MaterialParams, Scene, SceneData, Vertex};
-use crate::util;
+use crate::scene::{MaterialParams, Scene, Vertex};
+use crate::{gltf_import, util};
 
 pub struct Renderer {
     device: Device,
@@ -34,7 +34,8 @@ impl Renderer {
         let render_targets = RenderTargets::new(&device, &swapchain)?;
         let render_pass = RenderPass::new(&device, &swapchain, &render_targets)?;
         let frame_queue = FrameQueue::new(&device)?;
-        let scene_data = SceneData::from_gltf(Path::new("models/duck/Duck0.gltf"))?;
+        // let scene_data = gltf_import::load(Path::new("models/duck/Duck0.gltf"))?;
+        let scene_data = gltf_import::load(Path::new("models/sponza/Sponza.gltf"))?;
 
         let scene = Scene::from_scene_data(
             &device,

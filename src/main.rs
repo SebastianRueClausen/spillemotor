@@ -15,6 +15,7 @@ mod core;
 mod util;
 mod scene;
 mod light;
+mod gltf_import;
 
 use anyhow::Result;
 

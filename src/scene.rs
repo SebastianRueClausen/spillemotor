@@ -2,8 +2,7 @@ use glam::{Vec3, Vec2, Mat4};
 use anyhow::Result;
 use ash::vk;
 
-use std::{fs, io, mem};
-use std::path::{PathBuf, Path};
+use std::mem;
 use std::ops::Index;
 use std::time::Duration;
 
@@ -538,244 +537,27 @@ fn create_texture_sampler(device: &Device) -> Result<vk::Sampler> {
     })
 }
 
+#[derive(Default)]
 pub struct SceneData {
-    meshes: Vec<MeshData>,
-    materials: Vec<MaterialData>,
+    pub meshes: Vec<MeshData>,
+    pub materials: Vec<MaterialData>,
 }
 
-struct ImageData {
-    data: Vec<u8>,
-    height: u32,
-    width: u32,
+pub struct ImageData {
+    pub data: Vec<u8>,
+    pub height: u32,
+    pub width: u32,
 }
 
-struct MeshData {
-    material: usize,
-    transform: Mat4,
-    verts: Vec<u8>,
-    indices: Vec<u8>,
+pub struct MeshData {
+    pub material: usize,
+    pub transform: Mat4,
+    pub verts: Vec<u8>,
+    pub indices: Vec<u8>,
 }
 
-struct MaterialData {
-    base_color: ImageData,
-    metallic: f32,
-    roughness: f32,
+pub struct MaterialData {
+    pub base_color: ImageData,
+    pub metallic: f32,
+    pub roughness: f32,
 }
-
-impl SceneData {
-    pub fn from_gltf(path: &Path) -> Result<Self> {
-        let file = fs::File::open(path)?;
-        let reader = io::BufReader::new(file);
-        let gltf = gltf::Gltf::from_reader(reader)?;
-
-        let buffer_data: Result<Vec<_>> = gltf
-            .buffers()
-            .map(|buffer| {
-                Ok(match buffer.source() {
-                    gltf::buffer::Source::Bin => {
-                        gltf.blob
-                            .as_ref()
-                            .map(|blob| blob.clone().into_boxed_slice())
-                            .ok_or_else(|| anyhow!("no binary blob in gltf scene"))?
-                    }
-                    gltf::buffer::Source::Uri(uri) => {
-                        let path: PathBuf = [path.parent().unwrap(), Path::new(uri)]
-                            .iter()
-                            .collect();
-                        fs::read(&path)?.into_boxed_slice()
-                    }
-                })
-            })
-            .collect();
-
-        let buffer_data = buffer_data?;
-
-        let get_buffer_data = |
-            view: &gltf::buffer::View,
-            offset: usize,
-            size: Option<usize>,
-        | -> Vec<u8>{
-            let start = view.offset() + offset;
-            let end = view.offset() + offset + size.unwrap_or(view.length() - offset);
-            buffer_data[view.buffer().index()][start..end].to_vec()
-        };
-
-        let load_image = |source: &gltf::image::Source| -> Result<ImageData> {
-            match source {
-                gltf::image::Source::View { view, mime_type } => {
-                    let format = match *mime_type {
-                        "image/png" => image::ImageFormat::Png,
-                        "image/jpeg" => image::ImageFormat::Jpeg,
-                        _ => return Err(anyhow!("image must be either png of jpeg")),
-                    };
-
-                    let input = get_buffer_data(view, 0, None);
-
-                    let image = image::load(io::Cursor::new(&input), format)?.into_rgba8();
-                    let data = image.as_raw().to_vec();
-
-                    Ok(ImageData {
-                        data,
-                        width: image.width(),
-                        height: image.height(),
-                    })
-                }
-                gltf::image::Source::Uri { uri, .. } => {
-                    let uri = Path::new(uri);
-
-                    let path: PathBuf = [path.parent().unwrap(), Path::new(uri)]
-                        .iter()
-                        .collect();
-
-                    let image = image::open(&path)?.into_rgba8();
-                    let data = image.as_raw().to_vec();
-
-                    Ok(ImageData {
-                        data,
-                        width: image.width(),
-                        height: image.height(),
-                    })
-                }
-            }
-        };
-
-        let materials: Result<Vec<_>> = gltf
-            .materials()
-            .map(|mat| {
-                let base_color = mat
-                    .pbr_metallic_roughness()
-                    .base_color_texture()
-                    .ok_or_else(|| anyhow!("no base color texture on material"))?
-                    .texture()
-                    .source()
-                    .source();
-                let metallic = mat
-                    .pbr_metallic_roughness()
-                    .metallic_factor();
-                let roughness = mat
-                    .pbr_metallic_roughness()
-                    .roughness_factor();
-                Ok(MaterialData {
-                    base_color: load_image(&base_color)?,
-                    metallic,
-                    roughness,
-                })
-            })
-            .collect();
-
-        let materials = materials?;
-
-        let meshes: Result<Vec<_>> = gltf.nodes()
-            .filter_map(|node| {
-                node.mesh().map(|mesh| (mesh, node.transform().matrix()))
-            })
-            .map(|(mesh, transform)| {
-                let Some(primitive) = mesh.primitives().nth(0) else {
-                    return Err(anyhow!("mesh {} has no primitives", mesh.index()));
-                };
-
-                let Some(material) = primitive.material().index() else {
-                    return Err(anyhow!("primitive {} doesn't have a material", primitive.index()));
-                };
-
-                let verts = {
-                    let positions = primitive.get(&gltf::Semantic::Positions);
-                    let normals = primitive.get(&gltf::Semantic::Normals);
-                    let texcoords = primitive.get(&gltf::Semantic::TexCoords(0));
-
-                    let (Some(positions), Some(texcoords), Some(normals)) =
-                        (positions, texcoords, normals) else
-                    {
-                        return Err(anyhow!(
-                            "prmitive {} doesn't have both positions, texcoords and normals",
-                            primitive.index(),
-                        ));
-                    };
-
-                    use gltf::accessor::{DataType, Dimensions};
-
-                    fn check_format(
-                        acc: &gltf::Accessor,
-                        dt: DataType,
-                        d: Dimensions,
-                    ) -> Result<()> {
-                        if dt != acc.data_type() {
-                            return Err(anyhow!( "accessor {} must be a {dt:?}", acc.index()));
-                        }
-                        if d != acc.dimensions() {
-                            return Err(anyhow!( "accessor {} must be a {d:?}", acc.index()));
-                        }
-                        Ok(())
-                    }
-                
-                    check_format(&positions, DataType::F32, Dimensions::Vec3)?;
-                    check_format(&normals, DataType::F32, Dimensions::Vec3)?;
-                    check_format(&texcoords, DataType::F32, Dimensions::Vec2)?;
-
-                    let get_accessor_data = |acc: &gltf::Accessor| -> Result<Vec<u8>> {
-                        let Some(view) = acc.view() else {
-                            return Err(anyhow!("no view on accessor {}", acc.index()));
-                        };
-                        Ok(get_buffer_data(&view, acc.offset(), Some(acc.count() * acc.size())))
-                    };
-
-                    let positions = get_accessor_data(&positions)?;
-                    let normals = get_accessor_data(&normals)?;
-                    let texcoords = get_accessor_data(&texcoords)?;
-
-                    assert_eq!(positions.len() / 3, texcoords.len() / 2);
-                    assert_eq!(positions.len() / 3, normals.len() / 3);
-
-                    positions
-                        .as_slice()
-                        .chunks(12)
-                        .zip(normals.as_slice().chunks(12))
-                        .zip(texcoords.as_slice().chunks(8))
-                        .flat_map(|((p, n), c)| [
-                            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11],
-                            n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11],
-                            c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
-                        ])
-                        .collect()
-                };
-
-                let indices = {
-                    let Some(indices) = primitive.indices() else {
-                        return Err(anyhow!("primtive {} has no indices", primitive.index()));
-                    };
-
-                    let data_type = indices.data_type();
-                    let dimensions = indices.dimensions();
-
-                    use gltf::accessor::{DataType, Dimensions};
-                    let (DataType::U16, Dimensions::Scalar) = (data_type, dimensions) else {
-                        return Err(anyhow!(
-                            "index attribute, accessor {}, must be scalar `u16`",
-                            indices.index(),
-                        ));
-                    };
-
-                    let Some(view) = indices.view() else {
-                        return Err(anyhow!("no view on accessor {}", indices.index()));
-                    };
-
-                    let offset = indices.offset();
-                    let size = indices.count() * indices.size();
-
-                    get_buffer_data(&view, offset, Some(size))
-                };
-                Ok(MeshData {
-                    verts,
-                    indices,
-                    material,
-                    transform: Mat4::from_cols_array_2d(&transform),
-                })
-            })
-            .collect();
-        Ok(Self {
-            meshes: meshes?,
-            materials,
-        })
-    }
-}
-

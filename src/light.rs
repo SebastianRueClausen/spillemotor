@@ -13,15 +13,15 @@ use crate::util;
 #[derive(Debug, Clone)]
 pub struct DirLight {
     /// The direction to the light.
-    pub direction: Vec3,
-    pub irradiance: Vec3,
+    pub direction: Vec3A,
+    pub irradiance: Vec3A,
 }
 
 impl Default for DirLight {
     fn default() -> Self {
         Self {
-            direction: Vec3::new(-1.0, -1.0, 0.0).normalize(),
-            irradiance: Vec3::splat(1.0),
+            direction: Vec3A::new(-1.0, -1.0, 0.0).normalize(),
+            irradiance: Vec3A::splat(1.0),
         }
     }
 }
@@ -55,8 +55,8 @@ struct LightBufferData {
 
 #[repr(C)]
 struct ClusterAabb {
-    max: Vec3,
-    min: Vec3,
+    max: Vec3A,
+    min: Vec3A,
 }
 
 #[repr(C)]
