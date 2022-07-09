@@ -6,7 +6,8 @@ use smallvec::SmallVec;
 
 use std::ffi::{self, CStr, CString};
 use std::path::Path;
-use std::{iter, mem, ops};
+use std::{iter, mem, ops, hash};
+use std::collections::HashMap;
 
 use crate::camera::Camera;
 use crate::light::DirLight;
@@ -20,6 +21,7 @@ pub struct Renderer {
     render_pass: RenderPass,
     frame_queue: FrameQueue,
     render_targets: RenderTargets,
+    descriptor_layout_cache: DescriptorLayoutCache,
     pub scene: Scene,
 }
 
@@ -34,11 +36,15 @@ impl Renderer {
         let render_targets = RenderTargets::new(&device, &swapchain)?;
         let render_pass = RenderPass::new(&device, &swapchain, &render_targets)?;
         let frame_queue = FrameQueue::new(&device)?;
+
+        let mut descriptor_layout_cache = DescriptorLayoutCache::default();
+
         // let scene_data = gltf_import::load(Path::new("models/duck/Duck0.gltf"))?;
         let scene_data = gltf_import::load(Path::new("models/sponza/Sponza.gltf"))?;
 
         let scene = Scene::from_scene_data(
             &device,
+            &mut descriptor_layout_cache,
             &swapchain,
             &render_pass,
             &render_targets,
@@ -51,6 +57,7 @@ impl Renderer {
             render_pass,
             frame_queue,
             render_targets,
+            descriptor_layout_cache,
             scene,
         })
     }
@@ -94,9 +101,7 @@ impl Renderer {
                 unsafe {
                     let begin_info = vk::CommandBufferBeginInfo::builder()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-                    self.device
-                        .handle
-                        .begin_command_buffer(frame.command_buffer, &begin_info)?;
+                    self.device.handle.begin_command_buffer(frame.command_buffer, &begin_info)?;
 
                     let clear_values = [
                         vk::ClearValue {
@@ -138,14 +143,14 @@ impl Renderer {
                         vk::SubpassContents::INLINE,
                     );
 
+                    self.device.handle.cmd_bind_pipeline(
+                        frame.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.scene.render_pipeline.handle,
+                    );
+
                     for model in self.scene.models.iter() {
                         let material = &self.scene.materials[model.material];
-
-                        self.device.handle.cmd_bind_pipeline(
-                            frame.command_buffer,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            material.pipeline.handle,
-                        );
 
                         let viewports = self.swapchain.viewports();
                         let scissors = self.swapchain.scissors();
@@ -155,10 +160,11 @@ impl Renderer {
 
                         let descriptor = material.descriptor[self.frame_queue.frame_index];
                         let light_descriptor = self.scene.light_descriptor[self.frame_queue.frame_index];
+
                         self.device.handle.cmd_bind_descriptor_sets(
                             frame.command_buffer,
                             vk::PipelineBindPoint::GRAPHICS,
-                            material.pipeline.layout,
+                            self.scene.render_pipeline.layout,
                             0,
                             &[descriptor, light_descriptor],
                             &[],
@@ -182,7 +188,7 @@ impl Renderer {
 
                         self.device.handle.cmd_push_constants(
                             frame.command_buffer,
-                            material.pipeline.layout,
+                            self.scene.render_pipeline.layout,
                             vk::ShaderStageFlags::VERTEX,
                             0,
                             model.transform_data(),
@@ -190,7 +196,7 @@ impl Renderer {
 
                         self.device.handle.cmd_push_constants(
                             frame.command_buffer,
-                            material.pipeline.layout,
+                            self.scene.render_pipeline.layout,
                             vk::ShaderStageFlags::FRAGMENT,
                             mem::size_of::<Mat4>() as u32,
                             util::bytes_of(&material.params),
@@ -280,9 +286,7 @@ impl Renderer {
         self.render_targets = RenderTargets::new(&self.device, &self.swapchain)?;
         self.render_pass = RenderPass::new(&self.device, &self.swapchain, &self.render_targets)?;
 
-        self.scene.handle_resize(&self.swapchain);
-
-        Ok(())
+        self.scene.handle_resize(&self.device, &self.swapchain)
     }
 }
 
@@ -297,6 +301,7 @@ impl Drop for Renderer {
             self.render_targets.destroy(&self.device);
             self.render_pass.destroy(&self.device);
             self.swapchain.destroy(&self.device);
+            self.descriptor_layout_cache.destroy(&self. device);
             self.scene.destroy(&self.device);
             self.device.destroy();
         }
@@ -1474,38 +1479,134 @@ impl UniformBuffers {
     }
 }
 
-pub fn create_shader_module(device: &Device, code: &[u8]) -> Result<vk::ShaderModule> {
-    if code.len() % mem::size_of::<u32>() != 0 {
-        return Err(anyhow!("shader code size must be a multiple of 4"));
-    }
-
-    if code.as_ptr().align_offset(mem::align_of::<u32>()) != 0 {
-        return Err(anyhow!("shader code must be aligned to `u32`"));
-    }
-
-    let code = unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u32, code.len() / 4) };
-    let info = vk::ShaderModuleCreateInfo::builder().code(code);
-    let module = unsafe { device.handle.create_shader_module(&info, None)? };
-
-    Ok(module)
+pub struct ShaderModule {
+    handle: vk::ShaderModule,
+    entry: CString,
 }
 
-pub enum BindingKind<'a> {
-    Buffer([&'a BufferView; FRAMES_IN_FLIGHT]),
-    Image(vk::Sampler, [&'a Image; FRAMES_IN_FLIGHT]),
+impl ShaderModule {
+    pub fn new(
+        device: &Device,
+        entry: &str,
+        code: &[u8],
+    ) -> Result<Self> {
+        if code.len() % mem::size_of::<u32>() != 0 {
+            return Err(anyhow!("shader code size must be a multiple of 4"));
+        }
+
+        if code.as_ptr().align_offset(mem::align_of::<u32>()) != 0 {
+            return Err(anyhow!("shader code must be aligned to `u32`"));
+        }
+
+        let code = unsafe { std::slice::from_raw_parts(code.as_ptr() as *const u32, code.len() / 4) };
+        let info = vk::ShaderModuleCreateInfo::builder().code(code);
+        let handle = unsafe { device.handle.create_shader_module(&info, None)? };
+
+        let Ok(entry) = CString::new(entry) else {
+            return Err(anyhow!("invalid entry name `entry`"));
+        };
+
+        Ok(ShaderModule { handle, entry })
+    }
+
+    fn stage_create_info(
+        &self,
+        stage: vk::ShaderStageFlags,
+    ) -> impl ops::Deref<Target = vk::PipelineShaderStageCreateInfo> + '_ {
+        vk::PipelineShaderStageCreateInfo::builder()
+            .stage(stage)
+            .module(self.handle)
+            .name(&self.entry)
+    }
+
+    pub unsafe fn destroy(&self, device: &Device) {
+        device.handle.destroy_shader_module(self.handle, None);
+    }
 }
 
-pub struct DescriptorBinding<'a> {
-    pub kind: BindingKind<'a>,
+pub struct DescriptorLayoutBindings {
+    bindings: SmallVec<[vk::DescriptorSetLayoutBinding; 6]>,
+}
+
+impl From<SmallVec<[vk::DescriptorSetLayoutBinding; 6]>> for DescriptorLayoutBindings {
+    fn from(bindings: SmallVec<[vk::DescriptorSetLayoutBinding; 6]>) -> Self {
+        Self { bindings }
+    }
+}
+
+impl hash::Hash for DescriptorLayoutBindings {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.bindings.len().hash(state);
+       
+        for b in &self.bindings {
+            b.binding.hash(state);
+            b.descriptor_type.hash(state);
+            b.descriptor_count.hash(state);
+            b.stage_flags.hash(state);
+        }
+    }
+}
+
+impl PartialEq for DescriptorLayoutBindings {
+    fn eq(&self, other: &Self) -> bool {
+        if self.bindings.len() != other.bindings.len() {
+            return false;
+        }
+
+        self.bindings
+            .iter()
+            .zip(other.bindings.iter())
+            .all(|(a, b)| {
+                a.binding == b.binding
+                    && a.descriptor_type == b.descriptor_type
+                    && a.descriptor_count == b.descriptor_count
+                    && a.stage_flags == b.stage_flags
+            })
+    }
+}
+
+impl Eq for DescriptorLayoutBindings {}
+
+#[derive(Default)]
+pub struct DescriptorLayoutCache {
+    lookup: HashMap<DescriptorLayoutBindings, vk::DescriptorSetLayout>,
+}
+
+impl DescriptorLayoutCache {
+    /// Destroy every layout in the cache. This will leave any descriptor sets using any layouts in
+    /// this cache invalid.
+    ///
+    /// # Safety
+    ///
+    /// Don't use any descriptor sets created using this cache after calling this function.
+    unsafe fn destroy(&mut self, device: &Device) {
+        for (_, layout) in self.lookup.drain() {
+            device.handle.destroy_descriptor_set_layout(layout, None);
+
+        }
+    }
+}
+
+pub enum BindingKind<'a, const N: usize> {
+    Buffer([&'a BufferView; N]),
+    Image(vk::Sampler, [&'a Image; N]),
+}
+
+pub struct DescriptorBinding<'a, const N: usize> {
+    pub kind: BindingKind<'a, N>,
     pub stage: vk::ShaderStageFlags,
     pub ty: vk::DescriptorType,
 }
 
-/// Holds one descriptor set for each image in flight. All share the same layout.
 pub struct DescriptorSet {
-    layout: vk::DescriptorSetLayout,
-    pool: vk::DescriptorPool,
-    sets: Vec<vk::DescriptorSet>,
+    /// NOTE: This is now owned, but simply a reference to a layout owned by the layout cache. It
+    /// will therefore no be destroyed when this is destroyed.
+    ///
+    /// TODO: Make this better.
+    pub layout: vk::DescriptorSetLayout,
+
+    pub pool: vk::DescriptorPool,
+    pub sets: Vec<vk::DescriptorSet>,
 }
 
 impl ops::Index<usize> for DescriptorSet {
@@ -1517,9 +1618,13 @@ impl ops::Index<usize> for DescriptorSet {
 }
 
 impl DescriptorSet {
-    pub fn new(device: &Device, bindings: &[DescriptorBinding]) -> Result<Self> {
+    pub fn new<const N: usize>(
+        device: &Device,
+        cache: &mut DescriptorLayoutCache,
+        bindings: &[DescriptorBinding<N>],
+    ) -> Result<Self> {
         let layout = unsafe {
-            let layout_bindings: SmallVec<[_; 12]> = bindings
+            let layout_bindings: SmallVec<[_; 6]> = bindings
                 .iter()
                 .enumerate()
                 .map(|(i, binding)| {
@@ -1532,10 +1637,20 @@ impl DescriptorSet {
                 })
                 .collect();
 
-            let layout_info = vk::DescriptorSetLayoutCreateInfo::builder()
-                .bindings(&layout_bindings);
+            let layout_bindings = DescriptorLayoutBindings::from(layout_bindings);
 
-            device.handle.create_descriptor_set_layout(&layout_info, None)?
+            if let Some(layout) = cache.lookup.get(&layout_bindings) {
+                layout.clone()
+            } else {
+                let layout_info = vk::DescriptorSetLayoutCreateInfo::builder()
+                    .bindings(&layout_bindings.bindings)
+                    .build();
+                let layout = device
+                    .handle
+                    .create_descriptor_set_layout(&layout_info, None)?;
+                cache.lookup.insert(layout_bindings, layout);
+                layout
+            }
         };
         
         let pool = unsafe {
@@ -1543,11 +1658,11 @@ impl DescriptorSet {
             
             for binding in bindings {
                 match sizes.iter_mut().position(|size| size.ty == binding.ty) {
-                    Some(pos) => sizes[pos].descriptor_count += FRAMES_IN_FLIGHT as u32,
+                    Some(pos) => sizes[pos].descriptor_count += N as u32,
                     None => {
                         sizes.push(vk::DescriptorPoolSize {
                             ty: binding.ty,
-                            descriptor_count: FRAMES_IN_FLIGHT as u32,
+                            descriptor_count: N as u32,
                         });
                     }
                 }
@@ -1555,13 +1670,13 @@ impl DescriptorSet {
 
             let info = vk::DescriptorPoolCreateInfo::builder()
                 .pool_sizes(&sizes)
-                .max_sets(FRAMES_IN_FLIGHT as u32);
+                .max_sets(N as u32);
 
             device.handle.create_descriptor_pool(&info, None)?
         };
 
         let sets = unsafe {
-            let layouts = vec![layout; FRAMES_IN_FLIGHT];
+            let layouts = vec![layout; N];
             let alloc_info = vk::DescriptorSetAllocateInfo::builder()
                 .descriptor_pool(pool)
                 .set_layouts(&layouts);
@@ -1569,7 +1684,7 @@ impl DescriptorSet {
             device.handle.allocate_descriptor_sets(&alloc_info)?
         };
 
-        for (frame, set) in sets.iter().enumerate() {
+        for (n, set) in sets.iter().enumerate() {
             struct Info {
                 ty: vk::DescriptorType,
                 buffer: [vk::DescriptorBufferInfo; 1],
@@ -1584,17 +1699,17 @@ impl DescriptorSet {
                             ty: binding.ty,
                             image: Default::default(),
                             buffer: [vk::DescriptorBufferInfo {
-                                buffer: buffers[frame].handle,
+                                buffer: buffers[n].handle,
                                 offset: 0,
-                                range: buffers[frame].size(),
+                                range: buffers[n].size(),
                             }],
                         },
                         BindingKind::Image(sampler, images) => Info {
                             ty: binding.ty,
                             buffer: Default::default(),
                             image: [vk::DescriptorImageInfo {
-                                image_layout: images[frame].layout,
-                                image_view: images[frame].view,
+                                image_layout: images[n].layout,
+                                image_view: images[n].view,
                                 sampler: *sampler,
                             }],
                         },
@@ -1628,48 +1743,67 @@ impl DescriptorSet {
     ///
     /// Don't use `self` after calling this function.
     pub unsafe fn destroy(&self, device: &Device) {
-        device.handle.destroy_descriptor_set_layout(self.layout, None);
         device.handle.destroy_descriptor_pool(self.pool, None);
     }
 }
 
 pub struct Pipeline {
-    handle: vk::Pipeline,
-    layout: vk::PipelineLayout,
+    pub handle: vk::Pipeline,
+    pub layout: vk::PipelineLayout,
 }
 
 impl Pipeline {
+    pub fn new_compute(
+        device: &Device,
+        shader: &ShaderModule,
+        descriptors: &[&DescriptorSet], 
+    ) -> Result<Self> {
+        let layout = unsafe {
+            let layouts: SmallVec<[_; 4]> = descriptors
+                .iter()
+                .map(|desc| desc.layout)
+                .collect();
+            let info = vk::PipelineLayoutCreateInfo::builder()
+                .set_layouts(&layouts);
+            device.handle.create_pipeline_layout(&info, None)?
+        };
+        let stage = shader.stage_create_info(vk::ShaderStageFlags::COMPUTE);
+        let create_infos = [vk::ComputePipelineCreateInfo::builder()
+            .layout(layout)
+            .stage(*stage)
+            .build()];
+        let handle = unsafe {
+            device.handle
+                .create_compute_pipelines(vk::PipelineCache::null(), &create_infos, None)
+                .map_err(|(_, err)| err)?
+                .first()
+                .unwrap()
+                .clone()
+        };
+        Ok(Self { handle, layout })
+    }
+
     pub fn new_render(
         device: &Device,
         swapchain: &Swapchain,
         render_pass: &RenderPass,
         render_targets: &RenderTargets,
-        descriptors: &[&DescriptorSet],
+        descriptor_layouts: &[vk::DescriptorSetLayout],
     ) -> Result<Self> {
-        let vertex_module = create_shader_module(
+        let vertex_module = ShaderModule::new(
             &device,
+            "main",
             include_bytes_aligned_as!(u32, "../shaders/vert.spv"),
         )?;
-
-        let fragment_module = create_shader_module(
+        let fragment_module = ShaderModule::new(
             &device,
+            "main",
             include_bytes_aligned_as!(u32, "../shaders/frag.spv"),
         )?;
-
-        let entry = CString::new("main").unwrap();
         let shader_stages = [
-            vk::PipelineShaderStageCreateInfo::builder()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vertex_module)
-                .name(&entry)
-                .build(),
-            vk::PipelineShaderStageCreateInfo::builder()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(fragment_module)
-                .name(&entry)
-                .build(),
+            *vertex_module.stage_create_info(vk::ShaderStageFlags::VERTEX),
+            *fragment_module.stage_create_info(vk::ShaderStageFlags::FRAGMENT),
         ];
-
         let vert_attrib = [
             vk::VertexInputAttributeDescription {
                 format: vk::Format::R32G32B32_SFLOAT,
@@ -1750,12 +1884,8 @@ impl Pipeline {
         ];
 
         let layout = unsafe {
-            let layouts: SmallVec<[_; 4]> = descriptors
-                .iter()
-                .map(|desc| desc.layout)
-                .collect();
             let info = vk::PipelineLayoutCreateInfo::builder()
-                .set_layouts(&layouts)
+                .set_layouts(&descriptor_layouts)
                 .push_constant_ranges(&push_constant_ranges);
             device.handle.create_pipeline_layout(&info, None)?
         };
@@ -1794,8 +1924,8 @@ impl Pipeline {
         };
 
         unsafe {
-            device.handle.destroy_shader_module(vertex_module, None);
-            device.handle.destroy_shader_module(fragment_module, None);
+            vertex_module.destroy(device); 
+            fragment_module.destroy(device); 
         }
 
         Ok(Self { handle, layout })

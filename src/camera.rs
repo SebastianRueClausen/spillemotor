@@ -64,8 +64,8 @@ pub struct Camera {
     yaw: f32,
     pitch: f32,
     fov: f32,
-    znear: f32,
-    zfar: f32,
+    pub znear: f32,
+    pub zfar: f32,
 
     rotation_speed: f32,
     movement_speed: f32,

@@ -10,7 +10,7 @@ use crate::util;
 use crate::camera::{InputState, Camera};
 use crate::light::{PointLight, Lights};
 use crate::core::{Device, Swapchain, RenderPass, RenderTargets, Pipeline};
-use crate::core::{DescriptorSet, DescriptorBinding, BindingKind};
+use crate::core::{DescriptorSet, DescriptorBinding, BindingKind, DescriptorLayoutCache};
 use crate::core::{VertUniform, FragUniform, UniformBuffers};
 use crate::resource::{Images, Buffers};
 
@@ -80,7 +80,6 @@ unsafe impl util::Pod for MaterialParams {}
 
 pub struct Material {
     pub base_color: usize,
-    pub pipeline: Pipeline,
     pub descriptor: DescriptorSet,
     pub params: MaterialParams,
 }
@@ -92,7 +91,6 @@ impl Material {
     ///
     /// Don't use `self` after calling this function.
     pub unsafe fn destroy(&self, device: &Device) {
-        self.pipeline.destroy(device);
         self.descriptor.destroy(device);
     }
 }
@@ -134,6 +132,8 @@ pub struct Scene {
     frag_uniform: FragUniform,
     uniform_buffers: UniformBuffers,
 
+    pub render_pipeline: Pipeline,
+
     pub light_descriptor: DescriptorSet,
 
     pub materials: Materials,
@@ -143,13 +143,14 @@ pub struct Scene {
 impl Scene {
     pub fn from_scene_data(
         device: &Device,
+        layout_cache: &mut DescriptorLayoutCache,
         swapchain: &Swapchain,
         render_pass: &RenderPass,
         render_targets: &RenderTargets,
         scene_data: &SceneData,
     ) -> Result<Self> {
         let camera = Camera::new(swapchain.aspect_ratio());
-        let lights = Lights::new(device, &camera, &swapchain, &[
+        let lights = Lights::new(device, layout_cache, &camera, &swapchain, &[
             PointLight::new(
                 Vec3::new(110.0, 45.0, -24.0),
                 Vec3::splat(32000.0),
@@ -375,7 +376,7 @@ impl Scene {
             })
             .collect();
 
-        let light_descriptor = DescriptorSet::new(device, &[
+        let light_descriptor = DescriptorSet::new(device, layout_cache, &[
             DescriptorBinding {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
@@ -416,7 +417,7 @@ impl Scene {
             .enumerate()
             .map(|(base_color, mat)| {
                 let base = &images[base_color];
-                let descriptor = DescriptorSet::new(device, &[
+                let descriptor = DescriptorSet::new(device, layout_cache, &[
                     DescriptorBinding {
                         ty: vk::DescriptorType::UNIFORM_BUFFER,
                         stage: vk::ShaderStageFlags::VERTEX,
@@ -440,17 +441,8 @@ impl Scene {
                     },
                 ])?;
 
-                let pipeline = Pipeline::new_render(
-                    device,
-                    swapchain,
-                    render_pass,
-                    render_targets,
-                    &[&descriptor, &light_descriptor],
-                )?;
-
                 Ok(Material {
                     base_color,
-                    pipeline,
                     descriptor,
                     params: MaterialParams {
                         metallic: mat.metallic,
@@ -462,6 +454,39 @@ impl Scene {
 
         let materials = materials?;
 
+        let render_pipeline = {
+            // Check that all the materials share the same descriptor set layout.
+            assert!({
+                let mut iter = materials.iter();
+                let first = iter.next();
+
+                iter.fold(first, |acc, mat| {
+                    acc.and_then(|stored| {
+                        if stored.descriptor.layout == mat.descriptor.layout {
+                            Some(stored)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .is_some()
+            });
+
+            let descriptor_layout = materials
+                .first()
+                .unwrap()
+                .descriptor
+                .layout;
+
+            Pipeline::new_render(
+                device,
+                swapchain,
+                render_pass,
+                render_targets,
+                &[descriptor_layout, light_descriptor.layout],
+            )?
+        };
+
         Ok(Self {
             camera,
             lights,
@@ -469,6 +494,7 @@ impl Scene {
             vert_uniform,
             frag_uniform,
             uniform_buffers,
+            render_pipeline,
             models: Models {
                 buffers,
                 models,
@@ -485,9 +511,9 @@ impl Scene {
         self.camera.update(input_state, dt); 
     }
 
-    pub fn handle_resize(&mut self, swapchain: &Swapchain) {
+    pub fn handle_resize(&mut self, device: &Device, swapchain: &Swapchain) -> Result<()> {
         self.camera.update_perspective(swapchain.aspect_ratio());
-        self.lights.handle_resize(&self.camera, swapchain); 
+        self.lights.handle_resize(device, &self.camera, swapchain)
     }
 
     pub fn upload_data(&mut self, frame_index: usize) {
@@ -512,6 +538,7 @@ impl Scene {
         self.uniform_buffers.destroy(device);
         self.materials.destroy(device);
         self.models.destroy(device);
+        self.render_pipeline.destroy(device);
     }
 }
 

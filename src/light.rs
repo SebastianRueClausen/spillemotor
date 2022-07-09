@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec3A, Vec3, UVec3, UVec2};
+use glam::{Mat4, Vec3A, Vec3, UVec4, UVec2};
 use ash::vk;
 use anyhow::Result;
 
@@ -6,7 +6,8 @@ use std::{iter, mem};
 
 use crate::camera::Camera;
 use crate::resource::{MappedMemory, Buffers, Buffer, BufferView};
-use crate::core::{Device, Swapchain, FRAMES_IN_FLIGHT};
+use crate::core::{Device, Swapchain, Pipeline, ShaderModule, FRAMES_IN_FLIGHT};
+use crate::core::{DescriptorSet, DescriptorBinding, BindingKind, DescriptorLayoutCache};
 use crate::util;
 
 #[repr(C)]
@@ -67,9 +68,11 @@ struct ClusterLights {
 
 #[repr(C)]
 pub struct GeneralData {
-    inv_perspective: Mat4,
+    perspective_inverse: Mat4,
     screen_extent: UVec2,
-    cluster_grid: UVec3,
+    cluster_grid: UVec4,
+    znear: f32,
+    zfar: f32,
 }
 
 unsafe impl util::Pod for GeneralData {}
@@ -77,16 +80,19 @@ unsafe impl util::Pod for GeneralData {}
 impl GeneralData {
     pub fn new(camera: &Camera, swapchain: &Swapchain) -> Self {
         Self {
-            inv_perspective: camera.perspective.inverse(),
+            perspective_inverse: camera.perspective.inverse(),
             screen_extent: UVec2::new(
                 swapchain.extent.width,
                 swapchain.extent.height,
             ),
-            cluster_grid: UVec3::new(
+            cluster_grid: UVec4::new(
                 CLUSTER_X as u32,
                 CLUSTER_Y as u32,
                 CLUSTER_Z as u32,
+                (swapchain.extent.width as f32 / CLUSTER_X as f32).ceil() as u32,
             ),
+            znear: camera.znear,
+            zfar: camera.zfar,
         }
     }
 }
@@ -147,8 +153,7 @@ impl GeneralDataBuffer {
 ///
 /// ## Cluster AABB buffer
 ///
-/// This holds a [`ClusterAabb`] for each cluster in the view fustrum. There is one copy per frame in
-/// flight.
+/// This holds a [`ClusterAabb`] for each cluster in the view fustrum.
 ///
 /// ## Active light buffer
 ///
@@ -163,11 +168,13 @@ impl GeneralDataBuffer {
 pub struct Lights {
     buffers: Buffers,
     pub general_data_buffer: GeneralDataBuffer,
+    cluster_build: ClusterBuild,
 }
 
 impl Lights {
     pub fn new(
         device: &Device,
+        layout_cache: &mut DescriptorLayoutCache,
         camera: &Camera,
         swapchain: &Swapchain,
         lights: &[PointLight],
@@ -194,11 +201,7 @@ impl Lights {
 
         let buffers = {
             let memory_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-            let mut create_infos = vec![light_buffer];
-
-            for info in iter::repeat(cluster_aabb_buffer).take(FRAMES_IN_FLIGHT) {
-                create_infos.push(info); 
-            }
+            let mut create_infos = vec![light_buffer, cluster_aabb_buffer];
 
             for info in iter::repeat(active_lights_buffer).take(FRAMES_IN_FLIGHT) {
                 create_infos.push(info); 
@@ -258,33 +261,96 @@ impl Lights {
 
         let general_data_buffer = GeneralDataBuffer::new(device, camera, swapchain)?;
 
-        Ok(Self { buffers, general_data_buffer })
+        let cluster_build = {
+            let descriptor = DescriptorSet::new(device, layout_cache, &[
+                DescriptorBinding {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    stage: vk::ShaderStageFlags::COMPUTE,
+                    kind: BindingKind::Buffer([
+                        &general_data_buffer.buffer, 
+                    ]),
+                },
+                // Cluster AABB buffer.
+                DescriptorBinding {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    stage: vk::ShaderStageFlags::COMPUTE,
+                    kind: BindingKind::Buffer([&buffers[1]]),
+                },
+            ])?;
+
+            let code = include_bytes_aligned_as!(u32, "../shaders/cluster_build.spv");
+            let shader = ShaderModule::new(device, "main", code)?;
+
+            let pipeline = Pipeline::new_compute(device, &shader, &[&descriptor])?;
+
+            unsafe { shader.destroy(device); }
+
+            ClusterBuild { pipeline, descriptor }
+        };
+
+        let lights = Self {
+            buffers,
+            general_data_buffer,
+            cluster_build,
+        };
+
+        lights.build_clusters(device)?;
+
+        Ok(lights)
+    }
+
+    fn build_clusters(&self, device: &Device) -> Result<()> {
+        device.transfer_with(|cmd| unsafe {
+            device.handle.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.cluster_build.pipeline.handle,
+            );
+
+            device.handle.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.cluster_build.pipeline.layout,
+                0,
+                &[self.cluster_build.descriptor[0]],
+                &[],
+            );
+
+            device.handle.cmd_dispatch(
+                cmd,
+                CLUSTER_X as u32,
+                CLUSTER_Y as u32,
+                CLUSTER_Z as u32,
+            );
+        })
     }
 
     pub fn light_buffer(&self) -> &BufferView {
         &self.buffers[0]
     }
 
-    pub fn cluster_aabb_buffer(&self, frame: usize) -> &BufferView {
-        &self.buffers[1 + frame]
+    #[allow(unused)]
+    pub fn cluster_aabb_buffer(&self) -> &BufferView {
+        &self.buffers[1]
     }
 
     pub fn active_lights_buffer(&self, frame: usize) -> &BufferView {
-        &self.buffers[3 + frame]
+        &self.buffers[2 + frame]
     }
 
     pub fn cluster_lights_buffer(&self, frame: usize) -> &BufferView {
-        &self.buffers[5 + frame]
+        &self.buffers[4 + frame]
     }
 
     /// Handle window resize.
     ///
     /// # Warning
     ///
-    /// This must only be called when the device is idle, e.g. not rendering is happening, as
+    /// This must only be called when the device is idle, e.g. no rendering is happening, as
     /// during so will upload data to a buffer which might be in use.
-    pub fn handle_resize(&mut self, camera: &Camera, swapchain: &Swapchain) {
+    pub fn handle_resize(&mut self, device: &Device, camera: &Camera, swapchain: &Swapchain) -> Result<()> {
         self.general_data_buffer.handle_resize(camera, swapchain);
+        self.build_clusters(device)
     }
 
     /// Destroy and leave `self` in an invalid state.
@@ -295,6 +361,29 @@ impl Lights {
     pub unsafe fn destroy(&self, device: &Device) {
         self.buffers.destroy(device);
         self.general_data_buffer.destroy(device);
+        self.cluster_build.destroy(device);
+    }
+}
+
+struct ClusterBuild {
+    descriptor: DescriptorSet,
+    pipeline: Pipeline,
+}
+
+struct LightCull {
+    descriptor: DescriptorSet,
+    pipeline: Pipeline,
+}
+
+impl ClusterBuild {
+    /// Destroy and leave `self` in an invalid state.
+    ///
+    /// # Safety
+    ///
+    /// Don't use `self` after calling this function.
+    pub unsafe fn destroy(&self, device: &Device) {
+        self.descriptor.destroy(device);
+        self.pipeline.destroy(device);
     }
 }
 
@@ -305,4 +394,3 @@ const CLUSTER_Z: usize = 8;
 const CLUSTER_COUNT: usize = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
 const LIGHTS_PER_CLUSTER: usize = 8;
 const MAX_LIGHT_COUNT: usize = 128;
-

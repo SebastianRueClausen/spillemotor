@@ -27,9 +27,11 @@ layout (std140, set = 0, binding = 1) uniform Ubo {
 layout (set = 0, binding = 2) uniform sampler2D tex_sampler;
 
 readonly layout (std140, set = 1, binding = 0) buffer LightGeneral {
-	mat4 inv_perspective;
+	mat4 perspective_inverse;
 	uvec2 screen_extent;
-	uvec3 cluster_grid;
+	uvec4 cluster_grid;
+	float znear;
+	float zfar;
 } light_general;
 
 readonly layout (std140, set = 1, binding = 1) buffer LightBuffer {
