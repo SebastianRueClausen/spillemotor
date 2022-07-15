@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec3A, Vec3, UVec4, UVec2};
+use glam::{Vec4, UVec3, Vec3, UVec4, UVec2};
 use ash::vk;
 use anyhow::Result;
 
@@ -7,106 +7,176 @@ use std::{iter, mem};
 use crate::camera::Camera;
 use crate::resource::{MappedMemory, Buffers, Buffer, BufferView};
 use crate::core::{Device, Swapchain, Pipeline, ShaderModule, FRAMES_IN_FLIGHT};
-use crate::core::{DescriptorSet, DescriptorBinding, BindingKind, DescriptorLayoutCache};
+use crate::core::{CameraUniforms, DescriptorSet, DescriptorBinding, BindingKind, DescriptorLayoutCache};
 use crate::util;
 
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct DirLight {
-    /// The direction to the light.
-    pub direction: Vec3A,
-    pub irradiance: Vec3A,
+    pub direction: Vec4,
+    pub irradiance: Vec4,
 }
 
 impl Default for DirLight {
     fn default() -> Self {
         Self {
-            direction: Vec3A::new(-1.0, -1.0, 0.0).normalize(),
-            irradiance: Vec3A::splat(1.0),
+            direction: Vec4::new(-1.0, -1.0, 0.0, 1.0).normalize(),
+            irradiance: Vec4::splat(0.2),
         }
     }
 }
 
+/// SPEED! SPEED! SPEED!
+///
+/// Split this into two parts:
+///
+/// - Cull: The radius and position in view space.
+/// - Draw: The lumen and position in world space.
+///
+/// Then we can run the update light compute shader which updates the view position on the cull
+/// struct. This shader has to access both the cull and draw parts, but only visits each light
+/// once, i.e. O(n).
+///
+/// When running the cluster update shader, we only have to access the cull data, and when drawing
+/// we only have to access the draw data.
+///
+/// We will have to have multiple copies of the cull data, but not draw data. This doesn't take up
+/// more vram than having the light position buffer we have now, since the cull data can fit into a
+/// single vec4.
+///
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PointLight {
-    pub pos: Vec3A,
-    pub lum: Vec3A,
+    pub world_position: Vec4,
+    pub lum: Vec4,
     // Used to determine the which clusters are effected by the light.
+    //
+    // TODO: Could perhaps be calculated from `lum`?.
     pub radius: f32,
 }
 
 impl PointLight {
     pub fn new(pos: Vec3, lum: Vec3, radius: f32) -> Self {
         Self {
-            pos: Vec3A::from(pos),
-            lum: Vec3A::from(lum),
+            world_position: Vec4::from((pos, 1.0)),
+            lum: Vec4::from((lum, 1.0)),
             radius,
         }
     }
 }
 
+/// The data of the light buffer.
 #[repr(C)]
 #[derive(Debug)]
 struct LightBufferData {
-    count: u32, 
-    capacity: u32,
-    lights: [PointLight; MAX_LIGHT_COUNT],
+    point_light_count: u32, 
+
+    dir_light: DirLight,
+    point_lights: [PointLight; MAX_LIGHT_COUNT],
 }
 
 #[repr(C)]
-struct ClusterAabb {
-    max: Vec3A,
-    min: Vec3A,
+struct Aabb {
+    min: Vec4,
+    max: Vec4,
 }
+
+const CLUSTER_SIZE: u32 = 512;
 
 #[repr(C)]
-struct ClusterLights {
-    count: u32,
-    offset: u32, 
+pub struct ClusterInfo {
+    /// The number of subdivisions in each axis.
+    ///
+    /// w is the total number of clusters:
+    ///
+    /// ```ignore
+    /// w = divisions.x * divisions.y * divisions.z;
+    /// ```
+    subdivisions: UVec4,
+
+    /// The size of the clusters in screen space in the x and y dimensions.
+    ///
+    /// The size on the z-axis is not constant but scales logarithmic as nears the z_far plane.
+    cluster_size: UVec2,
+
+    z_near: f32,
+
+    /// This is used to calculate the near plane for a division k.
+    ///
+    /// It's taken directly from the paper "clustered deferred and forward shading - Ola Olsson,
+    /// Markus Billeter and Ulf Assarsson".
+    ///
+    /// The near and far plane for division k is calculated as:
+    ///
+    /// ```ignore
+    /// near = k_near.pow(k);
+    /// far = (k_near + 1.0).pow(k);
+    /// ```
+    k_near: f32,
+
+    /// The depth factor is used to calculate the z slice from a given screen position and z
+    /// coordinate in view space.
+    ///
+    /// The z slice can be calculated as:
+    ///
+    /// ```ignore
+    /// let z_slice = (z_view / z_near).ln() / depth_factor;
+    /// ```
+    depth_factor: f32,
 }
 
-#[repr(C)]
-pub struct GeneralData {
-    perspective_inverse: Mat4,
-    screen_extent: UVec2,
-    cluster_grid: UVec4,
-    znear: f32,
-    zfar: f32,
-}
+impl ClusterInfo {
+    fn new(swapchain: &Swapchain, camera: &Camera) -> Self {
+        let fov = (camera.fov / 2.0).to_radians();
+        let z_near = camera.z_near;
+        let z_far = camera.z_far;
 
-unsafe impl util::Pod for GeneralData {}
+        let subdivisions_x = swapchain.extent.width.div_ceil(CLUSTER_SIZE);
+        let subdivisions_y = swapchain.extent.height.div_ceil(CLUSTER_SIZE);
 
-impl GeneralData {
-    pub fn new(camera: &Camera, swapchain: &Swapchain) -> Self {
+        let screen_depth = 2.0 * fov.tan() / subdivisions_y as f32;
+        let k_near = 1.0 + screen_depth;
+        let depth_factor = 1.0 / k_near.ln();
+
+        let subdivisions_z = ((z_far / z_near).ln() * depth_factor).floor() as u32;
+        let cluster_count = subdivisions_x * subdivisions_y * subdivisions_z;
+
         Self {
-            perspective_inverse: camera.perspective.inverse(),
-            screen_extent: UVec2::new(
-                swapchain.extent.width,
-                swapchain.extent.height,
+            subdivisions: UVec4::new(
+                subdivisions_x,
+                subdivisions_y,
+                subdivisions_z,
+                cluster_count,
             ),
-            cluster_grid: UVec4::new(
-                CLUSTER_X as u32,
-                CLUSTER_Y as u32,
-                CLUSTER_Z as u32,
-                (swapchain.extent.width as f32 / CLUSTER_X as f32).ceil() as u32,
-            ),
-            znear: camera.znear,
-            zfar: camera.zfar,
+            cluster_size: UVec2::splat(CLUSTER_SIZE),
+            depth_factor,
+            z_near,
+            k_near,
         }
+    }
+
+    pub fn cluster_subdivisions(&self) -> UVec3 {
+        self.subdivisions.truncate()
+    }
+
+    pub fn cluster_count(&self) -> u32 {
+        self.subdivisions.w
     }
 }
 
-pub struct GeneralDataBuffer {
+unsafe impl util::Pod for ClusterInfo {}
+
+pub struct ClusterInfoBuffer {
     pub buffer: Buffer,
     mapped: MappedMemory,
+    pub info: ClusterInfo,
 }
 
-impl GeneralDataBuffer {
+impl ClusterInfoBuffer {
     fn new(device: &Device, camera: &Camera, swapchain: &Swapchain) -> Result<Self> {
         let info = vk::BufferCreateInfo::builder()
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .size(mem::size_of::<GeneralData>() as u64)
+            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+            .size(mem::size_of::<ClusterInfo>() as u64)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
 
@@ -115,21 +185,18 @@ impl GeneralDataBuffer {
 
         let buffer = Buffer::new(device, &info, memory_flags)?;
         let mapped = buffer.block.map(device)?;
+        let info = ClusterInfo::new(swapchain, camera);
 
-        let data = GeneralData::new(camera, swapchain);
+        unsafe { mapped.get_range(..).copy_from_slice(util::bytes_of(&info)); }
 
-        unsafe {
-            mapped.get_range(..).copy_from_slice(util::bytes_of(&data));
-        }
-
-        Ok(Self { buffer, mapped })
-
+        Ok(Self { buffer, mapped, info })
     }
 
-    fn handle_resize(&self, camera: &Camera, swapchain: &Swapchain) {
-        let data = GeneralData::new(camera, swapchain);
+    fn handle_resize(&mut self, camera: &Camera, swapchain: &Swapchain) {
+        self.info = ClusterInfo::new(swapchain, camera);
+         
         unsafe {
-            self.mapped.get_range(..).copy_from_slice(util::bytes_of(&data));
+            self.mapped.get_range(..).copy_from_slice(util::bytes_of(&self.info));
         }
     }
 
@@ -138,6 +205,34 @@ impl GeneralDataBuffer {
     }
 }
 
+/// Pipelines and buffers used to implement clustered shading as described in the paper.
+/// "clustered deferred and forward shading - Ola Olsson, Markus Billeter and Ulf Assarsson".
+///
+/// # The pipeline stages
+///
+/// Three compute shaders are used to cluster and cull the lights, two of which runs every frame.
+///
+/// ## Cluster build
+/// 
+/// This only runs once on startup and every time the window is resized. It's calculates an AABB
+/// for each cluster in view space. 
+///
+/// ## Light update
+///
+/// This is the first shader to run every frame. It runs in `O(n)` time, where n is the number of
+/// lights in the scene. It simply updates the light position buffer by transforming the world
+/// space coordinate of each light into view space.
+///
+/// ## Cluster Update
+///
+/// This runs after the light update stage is done. It's job is to find which lights effects which
+/// clusters. For now it's very naiv. It works by simply iterating through each cluster and
+/// checking which lights sphere intersects with the clusters AABB. This means that it has a time
+/// complexity of `O(n * k)` time where n is the number of lights and `k` the number of clusters.
+///
+/// This could be improved by an accelerated structure such as an BVH as descriped in the paper
+/// "clustered deferred and forward shading - Ola Olsson, Markus Billeter and Ulf Assarsson".
+///
 /// # The different buffers
 ///
 /// ## Light buffer
@@ -146,71 +241,93 @@ impl GeneralDataBuffer {
 /// static meaning that all the lights are uploaded up front and can't be changed at runtime
 /// without temperarely stopping rendering and uploading the new data via a staging buffer.
 ///
-/// however it could become dynamic in the future, in which case we will probably have to have a
-/// copy per frame in flight.
+/// ## AABB buffer
 ///
-/// Visible in the fragment shader.
+/// This holds an [`Aabb`] for each cluster in the view fustrum. This one is created at startup and
+/// recreated if the resolution changes.
 ///
-/// ## Cluster AABB buffer
+/// ## Light index buffer
 ///
-/// This holds a [`ClusterAabb`] for each cluster in the view fustrum.
+/// A list of indices to lights in each cluster. Each cluster has it's own slice of
+/// `LIGHTS_PER_CLUSTER` indices. The offset into the list for cluster with index k is calculated
+/// as `LIGHTS_PER_CLUSTER * k`. If less than `LIGHTS_PER_CLUSTER` lights are in the cluster, then
+/// the end is marked with an terminal invalid index.
 ///
-/// ## Active light buffer
+/// This buffer has a copy for each frame in flight and is updated before drawing each frame by
+/// the `cluster_update` compute shader.
+//
+/// This is one of two main ways of doing this. Another way would be to have another buffer with
+/// info for each cluster, with the base offset into this buffer and the amount of lights. It could
+/// have some advantages if we add support for another type of light, like flood lights.
 ///
-/// A simple list of all the indices of lights that are active and effects a cluster. There is one
-/// copy per frame in flight. Visible in the fragment shader.
+/// It could perhaps also have some performance improvements as the indices would be denser in
+/// memory, but that would also add one more layer of indirection in the fragment shader.
 ///
-/// ## Cluster light buffer
+/// ## Light position buffer
 ///
-/// This holds a [`ClusterLights`] for each cluster. There is one copy per frame in flight. Visible
-/// to the fragment shader.
+/// A list of the positions of all lights in view space. This is updated before doing light culling
+/// each frame. This is simply an optimization as we could just as easily transform the positions
+/// during light culling, but since light culling runs in `O(n * k)` time where n is the number
+/// of lights and `k` the number of clusters, this will hopefully speed things up by reducing the
+/// complexity to `O(n)` but adding an extra memory lookup during culling.
+///
+/// FIXME: Resizing the window technically invalidates every buffer which depend on the amount of
+/// clusters.
 ///
 pub struct Lights {
-    buffers: Buffers,
-    pub general_data_buffer: GeneralDataBuffer,
-    cluster_build: ClusterBuild,
+    pub buffers: Buffers,
+    pub light_count: u32,
+    pub cluster_info: ClusterInfoBuffer,
+    pub cluster_build: ComputeProgram,
+    pub light_update: ComputeProgram,
+    pub cluster_update: ComputeProgram,
 }
 
 impl Lights {
     pub fn new(
         device: &Device,
         layout_cache: &mut DescriptorLayoutCache,
+        camera_uniforms: &CameraUniforms,
         camera: &Camera,
         swapchain: &Swapchain,
         lights: &[PointLight],
     ) -> Result<Self> {
+        let cluster_info = ClusterInfoBuffer::new(device, camera, swapchain)?;
+        let cluster_count = cluster_info.info.cluster_count() as usize;
+
         let light_buffer = vk::BufferCreateInfo::builder()
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
             .size(mem::size_of::<LightBufferData>() as u64)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
+        let light_position_buffer = vk::BufferCreateInfo::builder()
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .size(mem::size_of::<[Vec4; MAX_LIGHT_COUNT]>() as u64)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .build();
         let cluster_aabb_buffer = vk::BufferCreateInfo::builder()
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .size((CLUSTER_COUNT * mem::size_of::<ClusterAabb>()) as u64)
+            .size((cluster_count * mem::size_of::<Aabb>()) as u64)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
-        let active_lights_buffer = vk::BufferCreateInfo::builder() .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .size((LIGHTS_PER_CLUSTER * CLUSTER_COUNT * mem::size_of::<u32>()) as u64)
-            .build();
-        let cluster_lights_buffer = vk::BufferCreateInfo::builder()
+        let light_index_buffer = vk::BufferCreateInfo::builder()
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .size((CLUSTER_COUNT * mem::size_of::<ClusterLights>()) as u64)
+            .size((cluster_count * LIGHTS_PER_CLUSTER * mem::size_of::<u32>()) as u64)
             .build();
 
         let buffers = {
             let memory_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-            let mut create_infos = vec![light_buffer, cluster_aabb_buffer];
-
-            for info in iter::repeat(active_lights_buffer).take(FRAMES_IN_FLIGHT) {
+            let mut create_infos = vec![
+                light_buffer,
+                cluster_aabb_buffer,
+            ];
+            for info in iter::repeat(light_index_buffer).take(FRAMES_IN_FLIGHT) {
                 create_infos.push(info); 
             }
-
-            for info in iter::repeat(cluster_lights_buffer).take(FRAMES_IN_FLIGHT) {
+            for info in iter::repeat(light_position_buffer).take(FRAMES_IN_FLIGHT) {
                 create_infos.push(info); 
             }
-
             Buffers::new(device, &create_infos, memory_flags, 4)?
         };
 
@@ -230,10 +347,10 @@ impl Lights {
                     .as_ptr()
                     .expect("light staging buffer doesn't have correct aligment");
 
-                (*ptr).count = lights.len() as u32;
-                (*ptr).capacity = MAX_LIGHT_COUNT as u32;
+                (*ptr).point_light_count = lights.len() as u32;
+                (*ptr).dir_light = DirLight::default();
 
-                for (dst, src) in (*ptr).lights.iter_mut().zip(lights.iter()) {
+                for (dst, src) in (*ptr).point_lights.iter_mut().zip(lights.iter()) {
                     *dst = src.clone();
                 }
             })?;
@@ -259,15 +376,18 @@ impl Lights {
 
         unsafe { light_staging.destroy(device); }
 
-        let general_data_buffer = GeneralDataBuffer::new(device, camera, swapchain)?;
-
         let cluster_build = {
             let descriptor = DescriptorSet::new(device, layout_cache, &[
                 DescriptorBinding {
-                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    ty: vk::DescriptorType::UNIFORM_BUFFER,
+                    stage: vk::ShaderStageFlags::COMPUTE,
+                    kind: BindingKind::Buffer([&cluster_info.buffer]),
+                },
+                DescriptorBinding {
+                    ty: vk::DescriptorType::UNIFORM_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
                     kind: BindingKind::Buffer([
-                        &general_data_buffer.buffer, 
+                        camera_uniforms.proj_uniform(),
                     ]),
                 },
                 // Cluster AABB buffer.
@@ -281,17 +401,92 @@ impl Lights {
             let code = include_bytes_aligned_as!(u32, "../shaders/cluster_build.spv");
             let shader = ShaderModule::new(device, "main", code)?;
 
-            let pipeline = Pipeline::new_compute(device, &shader, &[&descriptor])?;
+            let pipeline = Pipeline::new_compute(device, &shader, &[&descriptor], &[])?;
 
             unsafe { shader.destroy(device); }
 
-            ClusterBuild { pipeline, descriptor }
+            ComputeProgram { pipeline, descriptor }
+        };
+
+        let light_update = {
+            let descriptor = DescriptorSet::new(device, layout_cache, &[
+                DescriptorBinding {
+                    ty: vk::DescriptorType::UNIFORM_BUFFER,
+                    stage: vk::ShaderStageFlags::COMPUTE,
+                    kind: BindingKind::Buffer([
+                        camera_uniforms.view_uniform(0),
+                        camera_uniforms.view_uniform(1),
+                    ]),
+                },
+                // Light buffer.
+                DescriptorBinding {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    stage: vk::ShaderStageFlags::COMPUTE,
+                    kind: BindingKind::Buffer([&buffers[0], &buffers[0]]),
+                },
+                // Light position buffer.
+                DescriptorBinding {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    stage: vk::ShaderStageFlags::COMPUTE,
+                    kind: BindingKind::Buffer([&buffers[4], &buffers[5]]),
+                },
+            ])?;
+
+            let code = include_bytes_aligned_as!(u32, "../shaders/light_update.spv");
+            let shader = ShaderModule::new(device, "main", code)?;
+
+            let pipeline = Pipeline::new_compute(device, &shader, &[&descriptor], &[])?;
+
+            unsafe { shader.destroy(device); }
+
+            ComputeProgram { pipeline, descriptor }
+        };
+
+        let cluster_update = {
+            let descriptor = DescriptorSet::new(device, layout_cache, &[
+                // Light buffer.
+                DescriptorBinding {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    stage: vk::ShaderStageFlags::COMPUTE,
+                    kind: BindingKind::Buffer([&buffers[0], &buffers[0]]),
+                },
+                // Light position buffer.
+                DescriptorBinding {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    stage: vk::ShaderStageFlags::COMPUTE,
+                    kind: BindingKind::Buffer([&buffers[4], &buffers[5]]),
+                },
+                // AABB buffer.
+                DescriptorBinding {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    stage: vk::ShaderStageFlags::COMPUTE,
+                    kind: BindingKind::Buffer([&buffers[1], &buffers[1]]),
+                },
+                // Light index buffer.
+                DescriptorBinding {
+                    ty: vk::DescriptorType::STORAGE_BUFFER,
+                    stage: vk::ShaderStageFlags::COMPUTE,
+                    kind: BindingKind::Buffer([&buffers[2], &buffers[3]]),
+                },
+            ])?;
+
+            let code = include_bytes_aligned_as!(u32, "../shaders/cluster_update.spv");
+            let shader = ShaderModule::new(device, "main", code)?;
+
+            let pipeline = Pipeline::new_compute(device, &shader, &[&descriptor], &[])?;
+
+            unsafe { shader.destroy(device); }
+
+            ComputeProgram { pipeline, descriptor }
         };
 
         let lights = Self {
             buffers,
-            general_data_buffer,
+            cluster_info,
+            light_count: lights.len() as u32,
             cluster_build,
+            light_update,
+            cluster_update,
         };
 
         lights.build_clusters(device)?;
@@ -300,15 +495,15 @@ impl Lights {
     }
 
     fn build_clusters(&self, device: &Device) -> Result<()> {
-        device.transfer_with(|cmd| unsafe {
+        device.transfer_with(|command_buffer| unsafe {
             device.handle.cmd_bind_pipeline(
-                cmd,
+                command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.cluster_build.pipeline.handle,
             );
 
             device.handle.cmd_bind_descriptor_sets(
-                cmd,
+                command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.cluster_build.pipeline.layout,
                 0,
@@ -316,11 +511,13 @@ impl Lights {
                 &[],
             );
 
+            let subdivisions = self.cluster_info.info.cluster_subdivisions();
+
             device.handle.cmd_dispatch(
-                cmd,
-                CLUSTER_X as u32,
-                CLUSTER_Y as u32,
-                CLUSTER_Z as u32,
+                command_buffer,
+                subdivisions.x,
+                subdivisions.y,
+                subdivisions.z,
             );
         })
     }
@@ -334,11 +531,11 @@ impl Lights {
         &self.buffers[1]
     }
 
-    pub fn active_lights_buffer(&self, frame: usize) -> &BufferView {
+    pub fn light_index_buffer(&self, frame: usize) -> &BufferView {
         &self.buffers[2 + frame]
     }
 
-    pub fn cluster_lights_buffer(&self, frame: usize) -> &BufferView {
+    pub fn light_position_buffer(&self, frame: usize) -> &BufferView {
         &self.buffers[4 + frame]
     }
 
@@ -349,7 +546,7 @@ impl Lights {
     /// This must only be called when the device is idle, e.g. no rendering is happening, as
     /// during so will upload data to a buffer which might be in use.
     pub fn handle_resize(&mut self, device: &Device, camera: &Camera, swapchain: &Swapchain) -> Result<()> {
-        self.general_data_buffer.handle_resize(camera, swapchain);
+        self.cluster_info.handle_resize(camera, swapchain);
         self.build_clusters(device)
     }
 
@@ -360,22 +557,19 @@ impl Lights {
     /// Don't use `self` after calling this function.
     pub unsafe fn destroy(&self, device: &Device) {
         self.buffers.destroy(device);
-        self.general_data_buffer.destroy(device);
+        self.cluster_info.destroy(device);
         self.cluster_build.destroy(device);
+        self.light_update.destroy(device);
+        self.cluster_update.destroy(device);
     }
 }
 
-struct ClusterBuild {
-    descriptor: DescriptorSet,
-    pipeline: Pipeline,
+pub struct ComputeProgram {
+    pub descriptor: DescriptorSet,
+    pub pipeline: Pipeline,
 }
 
-struct LightCull {
-    descriptor: DescriptorSet,
-    pipeline: Pipeline,
-}
-
-impl ClusterBuild {
+impl ComputeProgram {
     /// Destroy and leave `self` in an invalid state.
     ///
     /// # Safety
@@ -387,10 +581,5 @@ impl ClusterBuild {
     }
 }
 
-const CLUSTER_X: usize = 8;
-const CLUSTER_Y: usize = 4;
-const CLUSTER_Z: usize = 8;
-
-const CLUSTER_COUNT: usize = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
-const LIGHTS_PER_CLUSTER: usize = 8;
+const LIGHTS_PER_CLUSTER: usize = 32;
 const MAX_LIGHT_COUNT: usize = 128;

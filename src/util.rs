@@ -47,6 +47,10 @@ pub fn bytes_of<T: Pod>(t: &T) -> &[u8] {
     }
 }
 
+unsafe impl Pod for glam::Mat4 {}
+unsafe impl Pod for glam::Vec3 {}
+unsafe impl Pod for glam::Vec4 {}
+
 #[test]
 fn test_lcm() {
     assert_eq!(lcm(5, 12), 60);

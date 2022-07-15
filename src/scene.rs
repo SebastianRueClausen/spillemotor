@@ -11,7 +11,7 @@ use crate::camera::{InputState, Camera};
 use crate::light::{PointLight, Lights};
 use crate::core::{Device, Swapchain, RenderPass, RenderTargets, Pipeline};
 use crate::core::{DescriptorSet, DescriptorBinding, BindingKind, DescriptorLayoutCache};
-use crate::core::{VertUniform, FragUniform, UniformBuffers};
+use crate::core::CameraUniforms;
 use crate::resource::{Images, Buffers};
 
 #[repr(C)]
@@ -125,17 +125,13 @@ impl Materials {
 }
 
 pub struct Scene {
-    lights: Lights,
-    camera: Camera,
+    pub lights: Lights,
+    pub camera: Camera,
 
-    vert_uniform: VertUniform,
-    frag_uniform: FragUniform,
-    uniform_buffers: UniformBuffers,
+    camera_uniforms: CameraUniforms,
 
     pub render_pipeline: Pipeline,
-
     pub light_descriptor: DescriptorSet,
-
     pub materials: Materials,
     pub models: Models,
 }
@@ -150,22 +146,15 @@ impl Scene {
         scene_data: &SceneData,
     ) -> Result<Self> {
         let camera = Camera::new(swapchain.aspect_ratio());
-        let lights = Lights::new(device, layout_cache, &camera, &swapchain, &[
+        let camera_uniforms = CameraUniforms::new(device, &camera, swapchain)?;
+
+        let lights = Lights::new(device, layout_cache, &camera_uniforms, &camera, &swapchain, &[
             PointLight::new(
-                Vec3::new(110.0, 45.0, -24.0),
-                Vec3::splat(32000.0),
-                10.0,
-            ),
-            PointLight::new(
-                Vec3::new(30.0, 55.0, -59.0),
-                Vec3::splat(32000.0),
-                10.0,
+                Vec3::new(-0.9, 0.25, -0.354),
+                Vec3::new(1.0, 0.0, 1.0) * 12.0,
+                6.0,
             ),
         ])?;
-
-        let uniform_buffers = UniformBuffers::new(&device)?;
-        let vert_uniform = VertUniform::default();
-        let frag_uniform = FragUniform::default();
 
         let staging = {
             let create_infos: Vec<_> = scene_data.meshes
@@ -190,16 +179,14 @@ impl Scene {
             Buffers::new(device, &create_infos, memory_flags, 4)?
         };
 
-        let mapped = staging.block.map(device)?;
-
-        scene_data.meshes.iter()
-            .flat_map(|mesh| [mesh.verts.as_slice(), mesh.indices.as_slice()])
-            .zip(staging.buffers.iter())
-            .for_each(|(src, dst)| unsafe {
-                mapped.get_range(dst.range.clone()).copy_from_slice(&src);
-            });
-
-        staging.block.unmap(device, mapped);
+        staging.block.map_with(device, |mapped| {
+            scene_data.meshes.iter()
+                .flat_map(|mesh| [mesh.verts.as_slice(), mesh.indices.as_slice()])
+                .zip(staging.buffers.iter())
+                .for_each(|(src, dst)| unsafe {
+                    mapped.get_range(dst.range.clone()).copy_from_slice(&src);
+                });
+        })?;
 
         let buffers = {
             let create_infos: Vec<_> = scene_data.meshes
@@ -265,17 +252,15 @@ impl Scene {
             Buffers::new(device, &create_infos, memory_flags, 4)?
         };
 
-        let mapped = staging.block.map(device)?;
-
-        scene_data.materials
-            .iter()
-            .map(|mat| mat.base_color.data.as_slice())
-            .zip(staging.iter())
-            .for_each(|(src, dst)| unsafe {
-                mapped.get_range(dst.range.clone()).copy_from_slice(&src);
-            });
-
-        staging.block.unmap(device, mapped);
+        staging.block.map_with(device, |mapped| {
+            scene_data.materials
+                .iter()
+                .map(|mat| mat.base_color.data.as_slice())
+                .zip(staging.iter())
+                .for_each(|(src, dst)| unsafe {
+                    mapped.get_range(dst.range.clone()).copy_from_slice(&src);
+                });
+        })?;
 
         let mut images = {
             let image_infos: Vec<_> = scene_data.materials
@@ -378,11 +363,11 @@ impl Scene {
 
         let light_descriptor = DescriptorSet::new(device, layout_cache, &[
             DescriptorBinding {
-                ty: vk::DescriptorType::STORAGE_BUFFER,
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
                 kind: BindingKind::Buffer([
-                    &lights.general_data_buffer.buffer, 
-                    &lights.general_data_buffer.buffer, 
+                    &lights.cluster_info.buffer, 
+                    &lights.cluster_info.buffer, 
                 ]),
             },
             DescriptorBinding {
@@ -397,16 +382,8 @@ impl Scene {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
                 kind: BindingKind::Buffer([
-                    lights.active_lights_buffer(0), 
-                    lights.active_lights_buffer(1), 
-                ]),
-            },
-            DescriptorBinding {
-                ty: vk::DescriptorType::STORAGE_BUFFER,
-                stage: vk::ShaderStageFlags::FRAGMENT,
-                kind: BindingKind::Buffer([
-                    lights.cluster_lights_buffer(0), 
-                    lights.cluster_lights_buffer(1), 
+                    lights.light_index_buffer(0), 
+                    lights.light_index_buffer(1), 
                 ]),
             },
         ])?;
@@ -420,18 +397,18 @@ impl Scene {
                 let descriptor = DescriptorSet::new(device, layout_cache, &[
                     DescriptorBinding {
                         ty: vk::DescriptorType::UNIFORM_BUFFER,
-                        stage: vk::ShaderStageFlags::VERTEX,
+                        stage: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                         kind: BindingKind::Buffer([
-                            uniform_buffers.get_vert(0),
-                            uniform_buffers.get_vert(1),
+                            camera_uniforms.view_uniform(0),
+                            camera_uniforms.view_uniform(1),
                         ]),
                     },
                     DescriptorBinding {
                         ty: vk::DescriptorType::UNIFORM_BUFFER,
                         stage: vk::ShaderStageFlags::FRAGMENT,
                         kind: BindingKind::Buffer([
-                            uniform_buffers.get_frag(0),
-                            uniform_buffers.get_frag(1),
+                            camera_uniforms.proj_uniform(),
+                            camera_uniforms.proj_uniform(),
                         ]),
                     },
                     DescriptorBinding {
@@ -491,9 +468,7 @@ impl Scene {
             camera,
             lights,
             light_descriptor,
-            vert_uniform,
-            frag_uniform,
-            uniform_buffers,
+            camera_uniforms,
             render_pipeline,
             models: Models {
                 buffers,
@@ -512,19 +487,13 @@ impl Scene {
     }
 
     pub fn handle_resize(&mut self, device: &Device, swapchain: &Swapchain) -> Result<()> {
-        self.camera.update_perspective(swapchain.aspect_ratio());
+        self.camera.update_proj(swapchain.aspect_ratio());
+        self.camera_uniforms.update_proj(&self.camera, swapchain);
         self.lights.handle_resize(device, &self.camera, swapchain)
     }
 
     pub fn upload_data(&mut self, frame_index: usize) {
-        self.vert_uniform.update(&self.camera);
-        self.frag_uniform.update(&self.camera);
-
-        self.uniform_buffers.upload_data(
-            frame_index,
-            &self.vert_uniform,
-            &self.frag_uniform,
-        );
+        self.camera_uniforms.update_view(frame_index, &self.camera);
     }
 
     /// Destroy and leave `self` in an invalid state.
@@ -535,7 +504,7 @@ impl Scene {
     pub unsafe fn destroy(&self, device: &Device) {
         self.lights.destroy(device);
         self.light_descriptor.destroy(device);
-        self.uniform_buffers.destroy(device);
+        self.camera_uniforms.destroy(device);
         self.materials.destroy(device);
         self.models.destroy(device);
         self.render_pipeline.destroy(device);

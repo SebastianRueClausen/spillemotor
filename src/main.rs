@@ -1,4 +1,4 @@
-#![feature(let_else)]
+#![feature(let_else, int_roundings)]
 
 #[macro_use]
 extern crate log;

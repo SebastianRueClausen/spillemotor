@@ -57,16 +57,13 @@ pub struct Camera {
     pub pos: Vec3,
     front: Vec3,
     up: Vec3,
-
-    pub perspective: Mat4,
+    pub proj: Mat4,
     pub view: Mat4,
-
     yaw: f32,
     pitch: f32,
-    fov: f32,
-    pub znear: f32,
-    pub zfar: f32,
-
+    pub fov: f32,
+    pub z_near: f32,
+    pub z_far: f32,
     rotation_speed: f32,
     movement_speed: f32,
 }
@@ -81,16 +78,11 @@ impl Camera {
         let pitch = 0.0;
 
         let fov = 66.0_f32;
-        let znear = 0.01;
-        let zfar = 1000.0;
+        let z_near = 0.1;
+        let z_far = 100.0;
 
         let view = Mat4::look_at_rh(pos, pos + front, up);
-        let perspective = Mat4::perspective_rh(
-            fov.to_radians(),
-            aspect_ratio,
-            znear,
-            zfar,
-        );
+        let proj = Mat4::perspective_rh(fov.to_radians(), aspect_ratio, z_near, z_far);
 
         Self {
             rotation_speed: 0.5,
@@ -101,10 +93,10 @@ impl Camera {
             yaw,
             pitch,
             fov,
-            znear,
-            zfar,
+            z_near,
+            z_far,
             view,
-            perspective,
+            proj,
         }
 
     }
@@ -144,12 +136,12 @@ impl Camera {
         self.view = Mat4::look_at_rh(self.pos, self.pos + self.front, self.up);
     }
 
-    pub fn update_perspective(&mut self, aspect_ratio: f32) {
-        self.perspective = Mat4::perspective_rh(
+    pub fn update_proj(&mut self, aspect_ratio: f32) {
+        self.proj = Mat4::perspective_rh(
             self.fov.to_radians(),
             aspect_ratio,
-            self.znear,
-            self.zfar,
+            self.z_near,
+            self.z_far,
         );
     }
 }
