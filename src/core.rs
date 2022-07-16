@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::camera::Camera;
 use crate::resource::{Buffers, BufferView, Image, Images, MappedMemory};
-use crate::scene::{MaterialParams, Scene, Vertex};
+use crate::scene::{ModelTransform, Scene, Vertex};
 use crate::{gltf_import, util};
 
 pub struct Renderer {
@@ -302,15 +302,7 @@ impl Renderer {
                             self.scene.render_pipeline.layout,
                             vk::ShaderStageFlags::VERTEX,
                             0,
-                            model.transform_data(),
-                        );
-
-                        self.device.handle.cmd_push_constants(
-                            frame.command_buffer,
-                            self.scene.render_pipeline.layout,
-                            vk::ShaderStageFlags::FRAGMENT,
-                            mem::size_of::<Mat4>() as u32,
-                            util::bytes_of(&material.params),
+                            util::bytes_of(model.transform()),
                         );
 
                         self.device.handle.cmd_draw_indexed(
@@ -1964,23 +1956,33 @@ impl Pipeline {
             *fragment_module.stage_create_info(vk::ShaderStageFlags::FRAGMENT),
         ];
         let vert_attrib = [
+            // Positions
             vk::VertexInputAttributeDescription {
                 format: vk::Format::R32G32B32_SFLOAT,
                 binding: 0,
                 location: 0,
                 offset: 0,
             },
+            // Normals
             vk::VertexInputAttributeDescription {
                 format: vk::Format::R32G32B32_SFLOAT,
                 binding: 0,
                 location: 1,
                 offset: mem::size_of::<Vec3>() as u32,
             },
+            // Texcoords
             vk::VertexInputAttributeDescription {
                 format: vk::Format::R32G32_SFLOAT,
                 binding: 0,
                 location: 2,
-                offset: mem::size_of::<[Vec3; 2]>() as u32,
+                offset: mem::size_of::<[Vec3; 2]>() as u32
+            },
+            // Tangents
+            vk::VertexInputAttributeDescription {
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                binding: 0,
+                location: 3,
+                offset: (mem::size_of::<[Vec3; 2]>() + mem::size_of::<Vec2>())as u32,
             },
         ];
 
@@ -2032,13 +2034,8 @@ impl Pipeline {
         let push_constant_ranges = [
             vk::PushConstantRange::builder()
                 .stage_flags(vk::ShaderStageFlags::VERTEX)
-                .size(mem::size_of::<Mat4>() as u32)
+                .size(mem::size_of::<ModelTransform>() as u32)
                 .offset(0)
-                .build(),
-            vk::PushConstantRange::builder()
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-                .size(mem::size_of::<MaterialParams>() as u32)
-                .offset(mem::size_of::<Mat4>() as u32)
                 .build(),
         ];
 

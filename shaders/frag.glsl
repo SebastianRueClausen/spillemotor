@@ -20,7 +20,9 @@ readonly layout (std140, set = 0, binding = 1) uniform Proj {
 	vec2 screen_dimensions;
 };
 
-layout (set = 0, binding = 2) uniform sampler2D tex_sampler;
+layout (set = 0, binding = 2) uniform sampler2D base_color_sampler;
+layout (set = 0, binding = 3) uniform sampler2D normal_sampler;
+layout (set = 0, binding = 4) uniform sampler2D metallic_roughness_sampler;
 
 readonly layout (std140, set = 1, binding = 0) uniform Cluster {
 	ClusterInfo cluster_info;
@@ -37,15 +39,14 @@ readonly layout (std430, set = 1, binding = 2) buffer LightIndices {
 	uint light_indices[];
 };
 
-layout (push_constant) uniform PushConstant {
-	layout(offset = 64) float roughness;
-	layout(offset = 68) float metallic;
-};
-
 layout (location = 0) in vec2 in_texcoord;
-layout (location = 1) in vec3 in_normal;
-layout (location = 2) in vec4 in_ws_pos;
-layout (location = 3) in float in_z_view;
+
+layout (location = 1) in vec3 in_world_normal;
+layout (location = 2) in vec4 in_world_tangent;
+layout (location = 3) in vec3 in_world_bitangent;
+layout (location = 4) in vec4 in_world_position;
+
+layout (location = 5) in float in_view_z;
 
 layout (location = 0) out vec4 out_color;
 
@@ -141,6 +142,7 @@ uint cluster_index(uvec3 coords) {
 }
 
 #ifdef DEBUG
+
 vec3 hsv2rgb(vec3 c) {
   vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
   vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
@@ -187,19 +189,21 @@ vec4 debug_cluster_overlay(vec4 background, uvec3 cluster_coords, uint lights_in
 #endif
 
 void main() {
-	vec4 color = texture(tex_sampler, in_texcoord);
-	vec3 view_dir = normalize(vec3(eye) - vec3(in_ws_pos));
+	vec4 color = texture(base_color_sampler, in_texcoord);
+	vec3 normal = texture(normal_sampler, in_texcoord).rgb * 2.0 - 1.0;
+	vec2 metallic_roughness = texture(metallic_roughness_sampler, in_texcoord).rg;
 
+	normal = normalize(
+		normal.x * in_world_tangent.xyz
+			+ normal.y * in_world_bitangent
+			+ normal.z * normalize(in_world_normal)
+	);
+
+	vec3 view_dir = normalize(vec3(eye) - vec3(in_world_position));
 	vec3 albedo = color.rgb;
 
-	float metallic = metallic;
-	float roughness = roughness * roughness;
-
-	// Make sure to re-normalize the `in_normal` since interpolating the normals will ever so slightly
-	// change the length of the vector.
-	//
-	// TODO: Not necessary if we do normal mapping.
-	vec3 normal = normalize(in_normal);
+	float metallic = metallic_roughness.r;
+	float roughness = metallic_roughness.g * metallic_roughness.g;
 
 	// Reflectance at normal incidence.	
 	vec3 f0 = mix(vec3(0.04), albedo, metallic);
@@ -215,7 +219,7 @@ void main() {
 		f0
 	);
 
-	uvec3 cluster_coords = cluster_coords(gl_FragCoord.xy, in_z_view);
+	uvec3 cluster_coords = cluster_coords(gl_FragCoord.xy, in_view_z);
 	uint cluster_index = cluster_index(cluster_coords);
 
 #ifdef CLUSTERED
@@ -231,10 +235,8 @@ void main() {
 
 		PointLight light = point_lights[light_index];
 
-		vec3 light_dir = normalize(vec3(light.pos) - vec3(in_ws_pos));
-		float dist = length(vec3(light.pos) - vec3(in_ws_pos));
-
-		// The irradiance of the light given it's lumen and distance. 
+		vec3 light_dir = normalize(vec3(light.pos) - vec3(in_world_position));
+		float dist = length(vec3(light.pos) - vec3(in_world_position));
 		vec3 irradiance = vec3(light.lum) / (4.0 * PI * dist * dist);
 
 		radiance += brdf(albedo, normal, view_dir, light_dir, irradiance, roughness, metallic, f0);
@@ -247,8 +249,6 @@ void main() {
 
 		vec3 light_dir = normalize(light.pos - vec3(in_ws_pos));
 		float dist = length(light.pos - vec3(in_ws_pos));
-
-		// The irradiance of the light given it's lumen and distance. 
 		vec3 irradiance = light.lum / (4.0 * PI * dist * dist);
 
 		radiance += brdf(albedo, normal, view_dir, light_dir, irradiance, roughness, metallic, f0);

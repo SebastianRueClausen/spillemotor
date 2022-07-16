@@ -6,6 +6,11 @@ use std::{fs, io};
 
 use crate::scene::{ImageData, MaterialData, MeshData, SceneData};
 
+enum ImageImportFormat {
+    Rgba,
+    Rg,
+}
+
 struct Importer {
     buffer_data: Vec<Box<[u8]>>,
     parent_path: PathBuf,
@@ -66,8 +71,12 @@ impl Importer {
         self.buffer_data[view.buffer().index()][start..end].to_vec()
     }
 
-    fn load_image_data(&self, source: &gltf::image::Source) -> Result<ImageData> {
-        match source {
+    fn load_image_data(
+        &self,
+        import_format: ImageImportFormat,
+        source: &gltf::image::Source,
+    ) -> Result<ImageData> {
+        let image = match source {
             gltf::image::Source::View { view, mime_type } => {
                 let format = match *mime_type {
                     "image/png" => image::ImageFormat::Png,
@@ -76,15 +85,7 @@ impl Importer {
                 };
 
                 let input = self.get_buffer_data(view, 0, None);
-
-                let image = image::load(io::Cursor::new(&input), format)?.into_rgba8();
-                let data = image.as_raw().to_vec();
-
-                Ok(ImageData {
-                    data,
-                    width: image.width(),
-                    height: image.height(),
-                })
+                image::load(io::Cursor::new(&input), format)?
             }
             gltf::image::Source::Uri { uri, .. } => {
                 let uri = Path::new(uri);
@@ -93,15 +94,31 @@ impl Importer {
                     .iter()
                     .collect();
 
-                let image = image::open(&path)?.into_rgba8();
+                image::open(&path)?
+            }
+        };
+
+        match import_format {
+            ImageImportFormat::Rgba => {
+                let image = image.into_rgba8();
                 let data = image.as_raw().to_vec();
 
-                Ok(ImageData {
-                    data,
+                return Ok(ImageData {
                     width: image.width(),
                     height: image.height(),
-                })
-            }
+                    data,
+                });
+            },
+            ImageImportFormat::Rg => {
+                let image = image.into_luma_alpha8();
+                let data = image.as_raw().to_vec();
+
+                return Ok(ImageData {
+                    width: image.width(),
+                    height: image.height(),
+                    data,
+                });
+            },
         }
     }
 
@@ -116,16 +133,29 @@ impl Importer {
                     .texture()
                     .source()
                     .source();
-                let metallic = mat
+                let normal = mat
+                    .normal_texture()
+                    .ok_or_else(|| anyhow!("no normal texture in material"))?
+                    .texture()
+                    .source()
+                    .source();
+                let metallic_roughness = mat
                     .pbr_metallic_roughness()
-                    .metallic_factor();
-                let roughness = mat
-                    .pbr_metallic_roughness()
-                    .roughness_factor();
+                    .metallic_roughness_texture()
+                    .ok_or_else(|| anyhow!("no metallic roughness texture in material"))?
+                    .texture()
+                    .source()
+                    .source();
+                let base_color = self.load_image_data(ImageImportFormat::Rgba, &base_color)?;
+                let normal = self.load_image_data(ImageImportFormat::Rgba, &normal)?;
+                let metallic_roughness = self.load_image_data(
+                    ImageImportFormat::Rg,
+                    &metallic_roughness,
+                )?;
                 Ok(MaterialData {
-                    base_color: self.load_image_data(&base_color)?,
-                    metallic,
-                    roughness,
+                    base_color,
+                    normal,
+                    metallic_roughness,
                 })
             })
             .collect();
@@ -147,14 +177,15 @@ impl Importer {
 
                     let verts = {
                         let positions = primitive.get(&gltf::Semantic::Positions);
-                        let normals = primitive.get(&gltf::Semantic::Normals);
                         let texcoords = primitive.get(&gltf::Semantic::TexCoords(0));
+                        let normals = primitive.get(&gltf::Semantic::Normals);
+                        let tangents = primitive.get(&gltf::Semantic::Tangents);
 
-                        let (Some(positions), Some(texcoords), Some(normals)) =
-                            (positions, texcoords, normals) else
+                        let (Some(positions), Some(texcoords), Some(normals), Some(tangents)) =
+                            (positions, texcoords, normals, tangents) else
                         {
                             return Err(anyhow!(
-                                "prmitive {} doesn't have both positions, texcoords and normals",
+                                "prmitive {} doesn't have both positions, texcoords, normals and tangents",
                                 primitive.index(),
                             ));
                         };
@@ -176,8 +207,9 @@ impl Importer {
                         }
                     
                         check_format(&positions, DataType::F32, Dimensions::Vec3)?;
-                        check_format(&normals, DataType::F32, Dimensions::Vec3)?;
                         check_format(&texcoords, DataType::F32, Dimensions::Vec2)?;
+                        check_format(&normals, DataType::F32, Dimensions::Vec3)?;
+                        check_format(&tangents, DataType::F32, Dimensions::Vec4)?;
 
                         let get_accessor_data = |acc: &gltf::Accessor| -> Result<Vec<u8>> {
                             let Some(view) = acc.view() else {
@@ -187,21 +219,29 @@ impl Importer {
                         };
 
                         let positions = get_accessor_data(&positions)?;
-                        let normals = get_accessor_data(&normals)?;
                         let texcoords = get_accessor_data(&texcoords)?;
+                        let normals = get_accessor_data(&normals)?;
+                        let tangents = get_accessor_data(&tangents)?;
 
                         assert_eq!(positions.len() / 3, texcoords.len() / 2);
                         assert_eq!(positions.len() / 3, normals.len() / 3);
+                        assert_eq!(positions.len() / 3, tangents.len() / 4);
 
                         positions
                             .as_slice()
                             .chunks(12)
-                            .zip(normals.as_slice().chunks(12))
-                            .zip(texcoords.as_slice().chunks(8))
-                            .flat_map(|((p, n), c)| [
+                            .zip(normals.as_slice().chunks(4 * 3))
+                            .zip(tangents.as_slice().chunks(4 * 4))
+                            .zip(texcoords.as_slice().chunks(4 * 2))
+                            .flat_map(|(((p, n), t), c)| [
+                                // Position
                                 p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11],
+                                // Normal
                                 n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11],
+                                // Texcoord
                                 c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+                                // Tangent
+                                t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15],
                             ])
                             .collect()
                     };

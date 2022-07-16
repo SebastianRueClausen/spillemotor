@@ -313,6 +313,11 @@ impl Buffers {
         self.buffers.iter()
     }
 
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.buffers.len()
+    }
+
     /// Create new collection of buffers allocated in a single memory block.
     ///
     /// The info about each buffer is determined by `create_infos`, and the resulting buffers will
@@ -523,6 +528,11 @@ impl ops::Index<usize> for Images {
 impl Images {
     pub fn iter(&self) -> impl Iterator<Item = &Image> {
         self.images.iter()
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.images.len()
     }
 
     /// Images are often stored in chunks of the same size. This is an easy way to iterate over

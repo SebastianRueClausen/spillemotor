@@ -1,4 +1,4 @@
-use glam::{Vec3, Vec2, Mat4};
+use glam::{Vec3, Vec4, Vec2, Mat4};
 use anyhow::Result;
 use ash::vk;
 
@@ -20,25 +20,31 @@ pub struct Vertex {
     pub position: Vec3,
     pub normal: Vec3,
     pub texcoord: Vec2,
+    pub tangent: Vec4,
 }
+
+pub struct ModelTransform {
+    #[allow(dead_code)]
+    transform: Mat4,
+
+    #[allow(dead_code)]
+    inverse_transpose_transform: Mat4,
+}
+
+unsafe impl util::Pod for ModelTransform {}
 
 pub struct Model {
     pub index_buffer: usize,
     pub vertex_buffer: usize,  
     pub index_count: u32,
     pub material: usize,
-    transform: Mat4,
+
+    transform: ModelTransform,
 }
 
 impl Model {
-    /// Get byte slice of transform data to transfer to the GPU.
-    pub fn transform_data(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                &self.transform as *const Mat4 as *const u8,
-                mem::size_of::<Mat4>(),
-            )
-        }
+    pub fn transform(&self) -> &ModelTransform {
+        &self.transform
     }
 }
 
@@ -70,18 +76,11 @@ impl Index<usize> for Models {
     }
 }
 
-#[repr(C)]
-pub struct MaterialParams {
-    pub roughness: f32,
-    pub metallic: f32,
-}
-
-unsafe impl util::Pod for MaterialParams {}
-
 pub struct Material {
     pub base_color: usize,
+    pub normal: usize,
+    pub metallic_roughness: usize,
     pub descriptor: DescriptorSet,
-    pub params: MaterialParams,
 }
 
 impl Material {
@@ -152,7 +151,17 @@ impl Scene {
             PointLight::new(
                 Vec3::new(-0.9, 0.25, -0.354),
                 Vec3::new(1.0, 0.0, 1.0) * 12.0,
-                6.0,
+                4.0,
+            ),
+            PointLight::new(
+                Vec3::new(-0.9, 0.25, -0.8),
+                Vec3::new(0.0, 1.0, 1.0) * 12.0,
+                4.0,
+            ),
+            PointLight::new(
+                Vec3::new(9.33, 0.88, 0.55),
+                Vec3::new(0.0, 1.0, 1.0) * 20.0,
+                4.0,
             ),
         ])?;
 
@@ -245,6 +254,16 @@ impl Scene {
                         .size(mat.base_color.data.len() as u64)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE)
                         .build(),
+                    vk::BufferCreateInfo::builder()
+                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                        .size(mat.normal.data.len() as u64)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .build(),
+                    vk::BufferCreateInfo::builder()
+                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                        .size(mat.metallic_roughness.data.len() as u64)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .build(),
                 ])
                 .collect();
             let memory_flags =
@@ -255,7 +274,11 @@ impl Scene {
         staging.block.map_with(device, |mapped| {
             scene_data.materials
                 .iter()
-                .map(|mat| mat.base_color.data.as_slice())
+                .flat_map(|mat| [
+                    mat.base_color.data.as_slice(),
+                    mat.normal.data.as_slice(),
+                    mat.metallic_roughness.data.as_slice(),
+                ])
                 .zip(staging.iter())
                 .for_each(|(src, dst)| unsafe {
                     mapped.get_range(dst.range.clone()).copy_from_slice(&src);
@@ -265,41 +288,61 @@ impl Scene {
         let mut images = {
             let image_infos: Vec<_> = scene_data.materials
                 .iter()
-                .map(|mat| {
-                    vk::ImageCreateInfo::builder()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-                        .format(vk::Format::R8G8B8A8_SRGB)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .initial_layout(vk::ImageLayout::UNDEFINED)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .extent(vk::Extent3D {
-                            width: mat.base_color.width,
-                            height: mat.base_color.height,
-                            depth: 1,
-                        })
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .build()
+                .flat_map(|mat| {
+                    fn image_info(
+                        image_data: &ImageData,
+                        format: vk::Format,
+                    ) -> vk::ImageCreateInfo {
+                        vk::ImageCreateInfo::builder()
+                            .image_type(vk::ImageType::TYPE_2D)
+                            .usage(
+                                vk::ImageUsageFlags::TRANSFER_DST
+                                    | vk::ImageUsageFlags::SAMPLED
+                            )
+                            .format(format)
+                            .tiling(vk::ImageTiling::OPTIMAL)
+                            .initial_layout(vk::ImageLayout::UNDEFINED)
+                            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                            .extent(vk::Extent3D {
+                                width: image_data.width,
+                                height: image_data.height,
+                                depth: 1,
+                            })
+                            .mip_levels(1)
+                            .array_layers(1)
+                            .samples(vk::SampleCountFlags::TYPE_1)
+                            .build()
+                    }
+                    [
+                        image_info(&mat.base_color, vk::Format::R8G8B8A8_SRGB),
+                        image_info(&mat.normal, vk::Format::R8G8B8A8_UNORM),
+                        image_info(&mat.metallic_roughness, vk::Format::R8G8_SRGB),
+                    ]
                 })
                 .collect();
 
             let view_infos: Vec<_> = scene_data.materials
                 .iter()
-                .map(|_| {
-                    let subresource_range = vk::ImageSubresourceRange::builder()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .base_mip_level(0)
-                        .level_count(1)
-                        .base_array_layer(0)
-                        .layer_count(1)
-                        .build();
-                    vk::ImageViewCreateInfo::builder()
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(vk::Format::R8G8B8A8_SRGB)
-                        .subresource_range(subresource_range)
-                        .build()
+                .flat_map(|_| {
+                    fn view_info(format: vk::Format) -> vk::ImageViewCreateInfo {
+                        let subresource_range = vk::ImageSubresourceRange::builder()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1)
+                            .build();
+                        vk::ImageViewCreateInfo::builder()
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .subresource_range(subresource_range)
+                            .format(format)
+                            .build()
+                    }
+                    [
+                        view_info(vk::Format::R8G8B8A8_SRGB),
+                        view_info(vk::Format::R8G8B8A8_UNORM),
+                        view_info(vk::Format::R8G8_SRGB),
+                    ]
                 })
                 .collect();
 
@@ -313,7 +356,7 @@ impl Scene {
         device.transfer_with(|command_buffer| {
             for (src, dst) in staging.iter().zip(images.iter()) {
                 // I think they should be the same size, but in some instance they aren't for some
-                // reason. Vulkan doesn't complain so i guess it's is alright.
+                // reason. Vulkan doesn't complain so i guess it's alright.
                 assert!(src.size() <= dst.size());
 
                 let subresource = vk::ImageSubresourceLayers::builder()
@@ -351,9 +394,14 @@ impl Scene {
             .iter()
             .enumerate()
             .map(|(i, mesh)| {
+                let transform = ModelTransform {
+                    transform: mesh.transform,
+                    inverse_transpose_transform: mesh.transform.inverse().transpose(),
+                };
+
                 Model {
                     material: mesh.material,
-                    transform: mesh.transform,
+                    transform,
                     vertex_buffer: i * 2,
                     index_buffer: i * 2 + 1,
                     index_count: (mesh.indices.len() / mem::size_of::<u16>()) as u32,
@@ -392,8 +440,13 @@ impl Scene {
         let materials: Result<Vec<_>> = scene_data.materials
             .iter()
             .enumerate()
-            .map(|(base_color, mat)| {
-                let base = &images[base_color];
+            .map(|(base, _)| {
+                let base = base * 3;
+
+                let base_color_index = base;
+                let normal_index = base + 1;
+                let metallic_roughness_index = base + 2;
+
                 let descriptor = DescriptorSet::new(device, layout_cache, &[
                     DescriptorBinding {
                         ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -414,17 +467,34 @@ impl Scene {
                     DescriptorBinding {
                         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                         stage: vk::ShaderStageFlags::FRAGMENT,
-                        kind: BindingKind::Image(sampler, [base; 2]),
+                        kind: BindingKind::Image(sampler, [
+                            &images[base_color_index],
+                            &images[base_color_index],
+                        ]),
+                    },
+                    DescriptorBinding {
+                        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        stage: vk::ShaderStageFlags::FRAGMENT,
+                        kind: BindingKind::Image(sampler, [
+                            &images[normal_index],
+                            &images[normal_index],
+                        ]),
+                    },
+                    DescriptorBinding {
+                        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        stage: vk::ShaderStageFlags::FRAGMENT,
+                        kind: BindingKind::Image(sampler, [
+                            &images[metallic_roughness_index],
+                            &images[metallic_roughness_index],
+                        ]),
                     },
                 ])?;
 
                 Ok(Material {
-                    base_color,
+                    base_color: base_color_index,
+                    metallic_roughness: metallic_roughness_index,
+                    normal: normal_index,
                     descriptor,
-                    params: MaterialParams {
-                        metallic: mat.metallic,
-                        roughness: mat.roughness,
-                    },
                 })
             })
             .collect();
@@ -554,6 +624,6 @@ pub struct MeshData {
 
 pub struct MaterialData {
     pub base_color: ImageData,
-    pub metallic: f32,
-    pub roughness: f32,
+    pub normal: ImageData,
+    pub metallic_roughness: ImageData,
 }

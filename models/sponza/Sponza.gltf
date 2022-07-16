@@ -6986,7 +6986,13 @@
         "metallicFactor": 0,
         "baseColorTexture": {
           "index": 6
+        },
+        "metallicRoughnessTexture": {
+          "index": 5
         }
+      },
+      "normalTexture": {
+        "index": 4
       }
     },
     {
@@ -7969,13 +7975,14 @@
         },
         {
           "attributes": {
-            "POSITION": 232,
-            "TEXCOORD_0": 233,
-            "NORMAL": 234
+            "POSITION": 228,
+            "TEXCOORD_0": 229,
+            "NORMAL": 230,
+            "TANGENT": 231
           },
           "mode": 4,
-          "material": 2,
-          "indices": 33
+          "material": 12,
+          "indices": 32
         },
         {
           "attributes": {
