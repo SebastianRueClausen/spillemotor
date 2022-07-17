@@ -13,6 +13,7 @@ layout (std140, set = 0, binding = 1) uniform Proj {
 	mat4 proj;
 	mat4 inverse_proj;
 	vec2 screen_dimensions;
+	vec2 z_plane;
 };
 
 layout (std430, set = 0, binding = 2) buffer Set1 {
@@ -26,44 +27,48 @@ vec4 screen_to_view(vec2 screen, float z) {
 	return view / view.w;
 }
 
-vec3 ray_intersect_plane(vec3 start, vec3 end, Plane plane) {
-	vec3 ray = end - start;
-	float t = (plane.dist - dot(plane.normal, start)) / dot(plane.normal, ray);
-	return start + t * ray;
-}
-
 uint cluster_index(uvec3 coords) {
-	return coords.x + cluster_info.subdivisions.x * (coords.y + cluster_info.subdivisions.y * coords.z);
+	return coords.z * cluster_info.subdivisions.x * cluster_info.subdivisions.y
+		+ coords.y * cluster_info.subdivisions.x
+		+ coords.x;
 }
 
 void main() {
 	uvec3 cluster_coords = gl_WorkGroupID;
 	uint cluster_index = cluster_index(cluster_coords);
 
-	vec2 screen_min = vec2(cluster_coords.xy * cluster_info.cluster_size);
-	vec2 screen_max = vec2((cluster_coords.xy + 1.0) * cluster_info.cluster_size);
+	vec2 screen_min = vec2(cluster_coords.xy * cluster_info.cluster_size.xy);
+	vec2 screen_max = vec2((cluster_coords.xy + 1.0) * cluster_info.cluster_size.xy);
 
-	vec4 view_min = screen_to_view(screen_min, 1.0);
-	vec4 view_max = screen_to_view(screen_max, 1.0);
+	vec3 view_min = screen_to_view(screen_min, 1.0).xyz;
+	vec3 view_max = screen_to_view(screen_max, 1.0).xyz;
 
-	float cluster_near = -cluster_info.z_near * pow(abs(cluster_info.k_near), cluster_coords.z);
-	float cluster_far = -cluster_info.z_near * pow(abs(cluster_info.k_near), cluster_coords.z + 1);
+	view_min.y = -view_min.y;
+	view_max.y = -view_max.y;
 
-	vec3 normal = vec3(0.0, 0.0, 1.0);
+	float z_near = z_plane.x;
+	float z_far = z_plane.y;
 
-	Plane near_plane = Plane(normal, cluster_near);
-    Plane far_plane = Plane(normal, cluster_far);
+	float z_far_over_z_near = z_far / z_near;
 
-	vec3 eye = vec3(0.0, 0.0, 0.0);
+	float view_near = -z_near * pow(
+		z_far_over_z_near,
+		cluster_coords.z / float(cluster_info.subdivisions.z)
+	);
 
-	vec3 near_min = ray_intersect_plane(eye, vec3(view_min), near_plane);
-	vec3 near_max = ray_intersect_plane(eye, vec3(view_max), near_plane);
+	float view_far = -z_near * pow(
+		z_far_over_z_near,
+		(cluster_coords.z + 1) / float(cluster_info.subdivisions.z)
+	);
 
-	vec3 far_min = ray_intersect_plane(eye, vec3(view_min), far_plane);
-	vec3 far_max = ray_intersect_plane(eye, vec3(view_max), far_plane);
+	vec3 min_near = view_min * view_near / view_min.z;
+	vec3 max_near = view_max * view_near / view_max.z;
+
+	vec3 min_far = view_min * view_far / view_min.z;
+	vec3 max_far = view_max * view_far / view_max.z;
 
 	aabbs[cluster_index] = Aabb(
-		vec4(min(near_min, min(near_max, min(far_min, far_max))), 1.0),
-		vec4(max(near_min, max(near_max, max(far_min, far_max))), 1.0)
+		vec4(min(min_near, min(max_near, min(min_far, max_far))), 1.0),
+		vec4(max(min_near, max(max_near, max(min_far, max_far))), 1.0)
 	);
 }

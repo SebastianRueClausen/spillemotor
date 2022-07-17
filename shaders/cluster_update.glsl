@@ -29,31 +29,16 @@ writeonly layout (std430, set = 0, binding = 3) buffer LightIndices {
 shared uint shared_light_count;
 shared uint shared_light_indices[MAX_LIGHTS_IN_CLUSTER];
 
-float square_dist_to_aabb(vec3 point, Aabb aabb) {
-	float dist = 0.0;
-
-	for (uint i = 0; i < 3; ++i) {
-		float v = point[i];
-
-		if (v < aabb.min_point[i]) {
-			dist += pow(aabb.min_point[i] - v, 2);
-		}
-
-		if (v > aabb.max_point[i]) {
-			dist += pow(v - aabb.max_point[i], 2);
-		}
-	}
-
-	return dist;
-}
-
-bool aabb_intersect_sphere(Aabb aabb, Sphere sphere) {
-	float square_dist = square_dist_to_aabb(sphere.pos, aabb);
-	return square_dist <= sphere.radius * sphere.radius;
+bool sphere_intersects_aabb(Aabb aabb, Sphere sphere) {
+	vec3 closest = max(vec3(aabb.min_point), min(sphere.pos, vec3(aabb.max_point)));
+	vec3 dist = closest - sphere.pos;
+	return dot(dist, dist) <= sphere.radius * sphere.radius;
 }
 
 uint cluster_index(uvec3 coords) {
-	return coords.x + gl_NumWorkGroups.x * (coords.y + gl_NumWorkGroups.y * coords.z);
+	return coords.z * gl_NumWorkGroups.x * gl_NumWorkGroups.y
+		+ coords.y * gl_NumWorkGroups.x
+		+ coords.x;
 }
 
 void main() {
@@ -82,7 +67,7 @@ void main() {
 
 		Sphere sphere = Sphere(pos, light.radius);
 
-		if (aabb_intersect_sphere(aabb, sphere)) {
+		if (sphere_intersects_aabb(aabb, sphere)) {
 			uint shared_index = atomicAdd(shared_light_count, 1);
 			shared_light_indices[shared_index] = light_index;
 		}

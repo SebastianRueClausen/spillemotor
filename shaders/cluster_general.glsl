@@ -1,14 +1,12 @@
 
-const uint MAX_LIGHT_COUNT = 128;
-const uint MAX_LIGHTS_IN_CLUSTER = 32;
+const uint MAX_LIGHT_COUNT = 256;
+const uint MAX_LIGHTS_IN_CLUSTER = 64;
 const uint LIGHT_INDEX_SENTINEL = 0x7fffffffu;
 
 struct ClusterInfo {
 	uvec4 subdivisions;
 	uvec2 cluster_size;
-	float z_near;
-	float k_near;
-	float depth_factor;
+	vec2 depth_factors;
 };
 
 struct Aabb {

@@ -206,7 +206,7 @@ impl Renderer {
                     self.device.handle.cmd_pipeline_barrier(
                         frame.command_buffer,
                         vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::PipelineStageFlags::ALL_GRAPHICS,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
                         vk::DependencyFlags::empty(),
                         &[],
                         &buffer_barriers,
@@ -476,6 +476,8 @@ impl Device {
             let ext_names = [
                 ext::DebugUtils::name().as_ptr(),
                 khr::Surface::name().as_ptr(),
+                #[cfg(target_os = "windows")]
+                khr::Win32Surface::name().as_ptr(),
                 #[cfg(target_os = "linux")]
                 khr::WaylandSurface::name().as_ptr(),
                 #[cfg(target_os = "macos")]
@@ -1065,6 +1067,15 @@ impl Surface {
 
         use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
         let handle = match window.raw_window_handle() {
+            #[cfg(target_os = "windows")]
+            RawWindowHandle::Windows(handle) => {
+                let info = vk::Win32SurfaceCreateInfoKHR::default()
+                    .hinstance(handle.hinstance)
+                    .hwnd(handle.hwnd);
+                let loader = khr::Win32Surface::new(entry, instance);
+                unsafe { loader.create_win32_surface(&info, allocation_callbacks) }
+            }
+
             #[cfg(target_os = "linux")]
             RawWindowHandle::Wayland(handle) => {
                 let info = vk::WaylandSurfaceCreateInfoKHR::builder()
@@ -1522,6 +1533,8 @@ pub struct ProjUniform {
     inverse_proj: Mat4,
     /// The screen dimensions.
     dimensions: Vec2,
+    /// z near and z far.
+    z_plane: Vec2,
 }
 
 unsafe impl util::Pod for ProjUniform {}
@@ -1535,7 +1548,9 @@ impl ProjUniform {
 
         let inverse_proj = camera.proj.inverse();
 
-        Self { proj: camera.proj.clone(), inverse_proj, dimensions, }
+        let z_plane = Vec2::new(camera.z_near, camera.z_far);
+
+        Self { proj: camera.proj.clone(), inverse_proj, dimensions, z_plane }
     }
 }
 

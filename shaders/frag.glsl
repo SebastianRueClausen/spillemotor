@@ -3,6 +3,7 @@
 
 #include "cluster_general.glsl"
 
+#define DEBUG
 #define CLUSTERED
 
 const float PI = 3.14159265358979323846264;
@@ -131,14 +132,15 @@ vec3 aces_approx(vec3 color) {
 }
 
 uvec3 cluster_coords(vec2 coords, float view_z) {
-	uvec2 ij = uvec2(coords / cluster_info.cluster_size);
-	uint k = uint(log(-view_z / cluster_info.z_near) * cluster_info.depth_factor);
-
+	uvec2 ij = uvec2(coords / cluster_info.cluster_size.xy);
+	uint k = uint(log(-view_z) * cluster_info.depth_factors.x - cluster_info.depth_factors.y);
 	return uvec3(ij, k);
 }
 
 uint cluster_index(uvec3 coords) {
-	return coords.x + cluster_info.subdivisions.x * (coords.y + cluster_info.subdivisions.y * coords.z);
+	return coords.z * cluster_info.subdivisions.x * cluster_info.subdivisions.y
+		+ coords.y * cluster_info.subdivisions.x
+		+ coords.x;
 }
 
 #ifdef DEBUG
@@ -156,6 +158,7 @@ float rand(vec2 co){
 vec4 debug_cluster_overlay(vec4 background, uvec3 cluster_coords, uint lights_in_cluster) {
     float cluster_overlay_alpha = 0.3;
 
+	/*
 	uint z_slice = cluster_coords.z;
     // A hack to make the colors alternate a bit more
     if ((z_slice & 1u) == 1u) {
@@ -175,13 +178,13 @@ vec4 debug_cluster_overlay(vec4 background, uvec3 cluster_coords, uint lights_in
         (1.0 - cluster_overlay_alpha) * background.rgb + cluster_overlay_alpha * cluster_color,
         background.a
     );
-	*/
 
     float max_light_complexity_per_cluster = 1.0;
     background.r = (1.0 - cluster_overlay_alpha) * background.r
         + cluster_overlay_alpha * smoothstep(0.0, max_light_complexity_per_cluster, float(lights_in_cluster));
     background.g = (1.0 - cluster_overlay_alpha) * background.g
         + cluster_overlay_alpha * (1.0 - smoothstep(0.0, max_light_complexity_per_cluster, float(lights_in_cluster)));
+	*/
 
 	return background;
 }

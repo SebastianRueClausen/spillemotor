@@ -23,6 +23,7 @@ pub struct Vertex {
     pub tangent: Vec4,
 }
 
+#[repr(C)]
 pub struct ModelTransform {
     #[allow(dead_code)]
     transform: Mat4,
@@ -147,23 +148,32 @@ impl Scene {
         let camera = Camera::new(swapchain.aspect_ratio());
         let camera_uniforms = CameraUniforms::new(device, &camera, swapchain)?;
 
-        let lights = Lights::new(device, layout_cache, &camera_uniforms, &camera, &swapchain, &[
-            PointLight::new(
-                Vec3::new(-0.9, 0.25, -0.354),
-                Vec3::new(1.0, 0.0, 1.0) * 12.0,
-                4.0,
-            ),
-            PointLight::new(
-                Vec3::new(-0.9, 0.25, -0.8),
-                Vec3::new(0.0, 1.0, 1.0) * 12.0,
-                4.0,
-            ),
-            PointLight::new(
-                Vec3::new(9.33, 0.88, 0.55),
-                Vec3::new(0.0, 1.0, 1.0) * 20.0,
-                4.0,
-            ),
-        ])?;
+        let mut lights = Vec::default();
+
+        for i in 0..100 {
+            let red = (i % 2) as f32;
+            let blue = ((i + 1) % 2) as f32;
+
+            let start = Vec3::new(-16.0, -3.0, -8.0);
+            let end = Vec3::new(15.0, 13.0, 8.0);
+
+            let position = start.lerp(end, i as f32 / 64.0);
+
+            lights.push(PointLight::new(
+                position,
+                Vec3::new(red, 1.0, blue) * 6.0,
+                8.0,
+            ));
+        }
+
+        let lights = Lights::new(
+            device,
+            layout_cache,
+            &camera_uniforms,
+            &camera,
+            &swapchain,
+            &lights,
+        )?;
 
         let staging = {
             let create_infos: Vec<_> = scene_data.meshes

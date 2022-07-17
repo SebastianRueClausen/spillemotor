@@ -1,4 +1,4 @@
-use glam::{Vec4, UVec3, Vec3, UVec4, UVec2};
+use glam::{Vec4, UVec3, Vec3, Vec2, UVec4, UVec2};
 use ash::vk;
 use anyhow::Result;
 
@@ -81,8 +81,6 @@ struct Aabb {
     max: Vec4,
 }
 
-const CLUSTER_SIZE: u32 = 512;
-
 #[repr(C)]
 pub struct ClusterInfo {
     /// The number of subdivisions in each axis.
@@ -99,60 +97,23 @@ pub struct ClusterInfo {
     /// The size on the z-axis is not constant but scales logarithmic as nears the z_far plane.
     cluster_size: UVec2,
 
-    z_near: f32,
-
-    /// This is used to calculate the near plane for a division k.
-    ///
-    /// It's taken directly from the paper "clustered deferred and forward shading - Ola Olsson,
-    /// Markus Billeter and Ulf Assarsson".
-    ///
-    /// The near and far plane for division k is calculated as:
-    ///
-    /// ```ignore
-    /// near = k_near.pow(k);
-    /// far = (k_near + 1.0).pow(k);
-    /// ```
-    k_near: f32,
-
-    /// The depth factor is used to calculate the z slice from a given screen position and z
-    /// coordinate in view space.
-    ///
-    /// The z slice can be calculated as:
-    ///
-    /// ```ignore
-    /// let z_slice = (z_view / z_near).ln() / depth_factor;
-    /// ```
-    depth_factor: f32,
+    depth_factors: Vec2,
 }
 
 impl ClusterInfo {
     fn new(swapchain: &Swapchain, camera: &Camera) -> Self {
-        let fov = (camera.fov / 2.0).to_radians();
-        let z_near = camera.z_near;
-        let z_far = camera.z_far;
+        let width = swapchain.extent.width;
+        let height = swapchain.extent.height;
 
-        let subdivisions_x = swapchain.extent.width.div_ceil(CLUSTER_SIZE);
-        let subdivisions_y = swapchain.extent.height.div_ceil(CLUSTER_SIZE);
+        let subdivisions = UVec4::new(12, 12, 24, 12 * 12 * 24);
+        let cluster_size = UVec2::new(width / subdivisions.x, height / subdivisions.y);
 
-        let screen_depth = 2.0 * fov.tan() / subdivisions_y as f32;
-        let k_near = 1.0 + screen_depth;
-        let depth_factor = 1.0 / k_near.ln();
+        let depth_factors = Vec2::new(
+            subdivisions.z as f32 / (camera.z_far / camera.z_near).ln(),
+            subdivisions.z as f32 * camera.z_near.ln() / (camera.z_far / camera.z_near).ln(),
+        );
 
-        let subdivisions_z = ((z_far / z_near).ln() * depth_factor).floor() as u32;
-        let cluster_count = subdivisions_x * subdivisions_y * subdivisions_z;
-
-        Self {
-            subdivisions: UVec4::new(
-                subdivisions_x,
-                subdivisions_y,
-                subdivisions_z,
-                cluster_count,
-            ),
-            cluster_size: UVec2::splat(CLUSTER_SIZE),
-            depth_factor,
-            z_near,
-            k_near,
-        }
+        Self { subdivisions, cluster_size, depth_factors }
     }
 
     pub fn cluster_subdivisions(&self) -> UVec3 {
@@ -581,5 +542,5 @@ impl ComputeProgram {
     }
 }
 
-const LIGHTS_PER_CLUSTER: usize = 32;
-const MAX_LIGHT_COUNT: usize = 128;
+const LIGHTS_PER_CLUSTER: usize = 64;
+const MAX_LIGHT_COUNT: usize = 256;

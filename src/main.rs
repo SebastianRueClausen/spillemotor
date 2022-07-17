@@ -80,7 +80,7 @@ fn main() -> Result<()> {
             }
         }
         Event::RedrawRequested(_) => {
-            trace!("frame time: {} ms", last_draw.elapsed().as_millis());
+            println!("frame time: {} ms", last_draw.elapsed().as_millis());
 
             last_draw = Instant::now();
 
