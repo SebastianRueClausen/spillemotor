@@ -14,7 +14,6 @@ const float PI = 3.14159265358979323846264;
 readonly layout (std140, set = 0, binding = 0) uniform View {
 	vec4 eye;
 	mat4 view;
-	mat4 inverse_view;
 	mat4 proj_view;
 };
 

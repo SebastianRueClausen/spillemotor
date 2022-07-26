@@ -290,14 +290,28 @@ impl Renderer {
                         self.scene.render_pipeline.handle,
                     );
 
+                    let viewports = self.swapchain.viewports();
+                    let scissors = self.swapchain.scissors();
+
+                    self.device.handle.cmd_set_viewport(frame.command_buffer, 0, &viewports);
+                    self.device.handle.cmd_set_scissor(frame.command_buffer, 0, &scissors);
+
+                    self.device.handle.cmd_bind_vertex_buffers(
+                        frame.command_buffer,
+                        0,
+                        &[self.scene.vertex_buffer().handle],
+                        &[0],
+                    );
+
+                    self.device.handle.cmd_bind_index_buffer(
+                        frame.command_buffer,
+                        self.scene.index_buffer().handle,
+                        0,
+                        vk::IndexType::UINT16,
+                    );
+
                     for model in self.scene.models.iter() {
                         let material = &self.scene.materials[model.material];
-
-                        let viewports = self.swapchain.viewports();
-                        let scissors = self.swapchain.scissors();
-
-                        self.device.handle.cmd_set_viewport(frame.command_buffer, 0, &viewports);
-                        self.device.handle.cmd_set_scissor(frame.command_buffer, 0, &scissors);
 
                         let descriptor = material.descriptor[frame.index];
                         let light_descriptor = self.scene.light_descriptor[frame.index];
@@ -309,22 +323,6 @@ impl Renderer {
                             0,
                             &[descriptor, light_descriptor],
                             &[],
-                        );
-
-                        let vertex_buffer = &self.scene.models.buffers[model.vertex_buffer];
-                        self.device.handle.cmd_bind_vertex_buffers(
-                            frame.command_buffer,
-                            0,
-                            &[vertex_buffer.handle],
-                            &[0],
-                        );
-
-                        let index_buffer = &self.scene.models.buffers[model.index_buffer];
-                        self.device.handle.cmd_bind_index_buffer(
-                            frame.command_buffer,
-                            index_buffer.handle,
-                            0,
-                            vk::IndexType::UINT16,
                         );
 
                         self.device.handle.cmd_push_constants(
@@ -339,18 +337,15 @@ impl Renderer {
                             frame.command_buffer,
                             model.index_count,
                             1,
-                            0,
-                            0,
+                            model.index_start,
+                            model.vertex_start as i32,
                             0,
                         );
                     }
 
                     self.text_pass.draw_text(&self.device, &self.swapchain, &frame, |obj| {
-                        obj.add_label(
-                            40.0,
-                            Vec3::new(20.0, 20.0, 0.5),
-                            &format!("fps: {}", 1000 / elapsed.as_millis()),
-                        );
+                        let fps = format!("fps: {}", 1000 / elapsed.as_millis());
+                        obj.add_label(40.0, Vec3::new(20.0, 20.0, 0.5), &fps);
                     })?;
 
                     self.device.handle.cmd_end_render_pass(frame.command_buffer);
@@ -1549,11 +1544,6 @@ pub struct ViewUniform {
     eye: Vec4,
     /// The view matrix.
     view: Mat4,
-    /// The inverse view matrix.
-    ///
-    /// This is used in the fragment shader to determine the light cluster the fragment lies within.
-    /// Doesn't seem like this should be necessary, but i can't seem to find another way to do this
-    inverse_view: Mat4,
     /// `proj * view`. This is cached to save a dot product between two 4x4 matrices
     /// for each vertex.
     proj_view: Mat4,
@@ -1562,10 +1552,9 @@ pub struct ViewUniform {
 impl ViewUniform {
     pub fn new(camera: &Camera) -> Self {
         let eye = Vec4::from((camera.pos, 0.0));
-        let inverse_view = camera.view.inverse();
         let proj_view = camera.proj * camera.view;
 
-        Self { eye, view: camera.view.clone(), inverse_view, proj_view }
+        Self { eye, view: camera.view.clone(), proj_view }
     }
 }
 

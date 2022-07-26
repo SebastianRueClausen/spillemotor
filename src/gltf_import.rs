@@ -2,9 +2,9 @@ use anyhow::Result;
 use glam::Mat4;
 
 use std::path::{Path, PathBuf};
-use std::{fs, io};
+use std::{fs, io, mem};
 
-use crate::scene::{ImageData, MaterialData, MeshData, SceneData};
+use crate::scene::{ImageData, MaterialData, MeshData, SceneData, Vertex};
 
 enum ImageImportFormat {
     Rgba,
@@ -162,6 +162,9 @@ impl Importer {
 
         let materials = materials?;
 
+        let mut vertex_data = Vec::<u8>::new();
+        let mut index_data = Vec::<u8>::new();
+
         let meshes: Result<Vec<_>> = self.gltf.nodes()
             .filter(|node| node.mesh().is_some())
             .map(|node| {
@@ -175,7 +178,7 @@ impl Importer {
                         return Err(anyhow!("primitive {} doesn't have a material", primitive.index()));
                     };
 
-                    let verts = {
+                    let vertex_start = {
                         let positions = primitive.get(&gltf::Semantic::Positions);
                         let texcoords = primitive.get(&gltf::Semantic::TexCoords(0));
                         let normals = primitive.get(&gltf::Semantic::Normals);
@@ -227,7 +230,9 @@ impl Importer {
                         assert_eq!(positions.len() / 3, normals.len() / 3);
                         assert_eq!(positions.len() / 3, tangents.len() / 4);
 
-                        positions
+                        let vertex_start = (vertex_data.len() / mem::size_of::<Vertex>()) as u32;
+
+                        vertex_data.extend(positions
                             .as_slice()
                             .chunks(12)
                             .zip(normals.as_slice().chunks(4 * 3))
@@ -243,10 +248,12 @@ impl Importer {
                                 // Tangent
                                 t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15],
                             ])
-                            .collect()
+                        );
+                        
+                        vertex_start
                     };
 
-                    let indices = {
+                    let (index_start, index_count) = {
                         let Some(indices) = primitive.indices() else {
                             return Err(anyhow!("primtive {} has no indices", primitive.index()));
                         };
@@ -269,14 +276,24 @@ impl Importer {
                         let offset = indices.offset();
                         let size = indices.count() * indices.size();
 
-                        self.get_buffer_data(&view, offset, Some(size))
+                        let indices = self.get_buffer_data(&view, offset, Some(size));
+
+                        let index_start = (index_data.len() / mem::size_of::<u16>()) as u32;
+                        let index_count = (indices.len() / mem::size_of::<u16>()) as u32;
+
+                        index_data.extend(&indices);
+
+                        (index_start, index_count)
                     };
 
+                    let transform = Mat4::from_cols_array_2d(&transform);
+
                     meshes.push(MeshData {
-                        verts,
-                        indices,
+                        vertex_start,
+                        index_start,
+                        index_count,
                         material,
-                        transform: Mat4::from_cols_array_2d(&transform),
+                        transform,
                     })
                 }
 
@@ -287,6 +304,8 @@ impl Importer {
         let meshes = meshes?.into_iter().flatten().collect();
 
         Ok(SceneData {
+            vertex_data,
+            index_data,
             meshes,
             materials,
         })

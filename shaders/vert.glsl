@@ -4,7 +4,6 @@
 layout (set = 0, binding = 0) uniform View {
 	vec4 eye;
 	mat4 view;
-	mat4 inverse_view;
 	mat4 proj_view;
 };
 

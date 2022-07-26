@@ -21,7 +21,7 @@ use crate::core::{
     DescriptorLayoutCache,
     CameraUniforms,
 };
-use crate::resource::{self, Images, Buffers};
+use crate::resource::{self, Images, Buffers, BufferView};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -43,9 +43,10 @@ pub struct ModelTransform {
 }
 
 pub struct Model {
-    pub index_buffer: usize,
-    pub vertex_buffer: usize,  
+    pub index_start: u32,
     pub index_count: u32,
+    pub vertex_start: u32,
+    
     pub material: usize,
 
     transform: ModelTransform,
@@ -54,34 +55,6 @@ pub struct Model {
 impl Model {
     pub fn transform(&self) -> &ModelTransform {
         &self.transform
-    }
-}
-
-pub struct Models {
-    pub buffers: Buffers,
-    models: Vec<Model>,
-}
-
-impl Models {
-    pub fn iter(&self) -> impl Iterator<Item = &Model> {
-        self.models.iter()
-    }
-
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        self.buffers.destroy(device);
-    }
-}
-
-impl Index<usize> for Models {
-    type Output = Model;
-
-    fn index(&self, idx: usize) -> &Self::Output {
-        &self.models[idx]
     }
 }
 
@@ -137,7 +110,8 @@ pub struct Scene {
     pub render_pipeline: Pipeline,
     pub light_descriptor: DescriptorSet,
     pub materials: Materials,
-    pub models: Models,
+    pub models: Vec<Model>,
+    pub buffers: Buffers,
 }
 
 impl Scene {
@@ -153,14 +127,14 @@ impl Scene {
     ) -> Result<Self> {
         let mut lights = Vec::default();
 
-        for i in 0..100 {
+        for i in 0..20 {
             let red = (i % 2) as f32;
             let blue = ((i + 1) % 2) as f32;
 
             let start = Vec3::new(-16.0, -3.0, -8.0);
             let end = Vec3::new(15.0, 13.0, 8.0);
 
-            let position = start.lerp(end, i as f32 / 64.0);
+            let position = start.lerp(end, i as f32 / 20.0);
 
             lights.push(PointLight::new(
                 position,
@@ -179,31 +153,26 @@ impl Scene {
         )?;
 
         let staging = {
-            let create_infos: Vec<_> = scene_data.meshes
-                .iter()
-                .flat_map(|mesh| [
-                    vk::BufferCreateInfo::builder()
-                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                        .size(mesh.verts.len() as u64)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .build(),
-                    vk::BufferCreateInfo::builder()
-                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                        .size(mesh.indices.len() as u64)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .build(),
-                ])
-                .collect();
-
+            let create_infos = [
+                vk::BufferCreateInfo::builder()
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    .size(scene_data.vertex_data.len() as u64)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .build(),
+                vk::BufferCreateInfo::builder()
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    .size(scene_data.index_data.len() as u64)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .build(),
+            ];
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-
             Buffers::new(device, &create_infos, memory_flags, 4)?
         };
 
         staging.block.map_with(device, |mapped| {
-            scene_data.meshes.iter()
-                .flat_map(|mesh| [mesh.verts.as_slice(), mesh.indices.as_slice()])
+            [scene_data.vertex_data.as_slice(), scene_data.index_data.as_slice()]
+                .iter()
                 .zip(staging.buffers.iter())
                 .for_each(|(src, dst)| unsafe {
                     mapped.get_range(dst.range.clone()).copy_from_slice(&src);
@@ -211,27 +180,23 @@ impl Scene {
         })?;
 
         let buffers = {
-            let create_infos: Vec<_> = scene_data.meshes
-                .iter()
-                .flat_map(|mesh| [
-                    vk::BufferCreateInfo::builder()
-                        .usage(
-                            vk::BufferUsageFlags::VERTEX_BUFFER
-                                | vk::BufferUsageFlags::TRANSFER_DST
-                        )
-                        .size(mesh.verts.len() as u64)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .build(),
-                    vk::BufferCreateInfo::builder()
-                        .usage(
-                            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST
-                        )
-                        .size(mesh.indices.len() as u64)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .build(),
-                ])
-                .collect();
-
+            let create_infos = [
+                vk::BufferCreateInfo::builder()
+                    .usage(
+                        vk::BufferUsageFlags::VERTEX_BUFFER
+                            | vk::BufferUsageFlags::TRANSFER_DST
+                    )
+                    .size(scene_data.vertex_data.len() as u64)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .build(),
+                vk::BufferCreateInfo::builder()
+                    .usage(
+                        vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST
+                    )
+                    .size(scene_data.index_data.len() as u64)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .build(),
+            ];
             Buffers::new(device, &create_infos, vk::MemoryPropertyFlags::DEVICE_LOCAL, 4)?
         };
 
@@ -405,8 +370,7 @@ impl Scene {
 
         let models: Vec<_> = scene_data.meshes
             .iter()
-            .enumerate()
-            .map(|(i, mesh)| {
+            .map(|mesh| {
                 let transform = ModelTransform {
                     transform: mesh.transform,
                     inverse_transpose_transform: mesh.transform.inverse().transpose(),
@@ -415,9 +379,9 @@ impl Scene {
                 Model {
                     material: mesh.material,
                     transform,
-                    vertex_buffer: i * 2,
-                    index_buffer: i * 2 + 1,
-                    index_count: (mesh.indices.len() / mem::size_of::<u16>()) as u32,
+                    vertex_start: mesh.vertex_start,
+                    index_start: mesh.index_start,
+                    index_count: mesh.index_count,
                 }
             })
             .collect();
@@ -608,27 +572,35 @@ impl Scene {
             pipeline
         };
 
+        let materials = Materials {
+            images,
+            sampler,
+            materials,
+        };
+
         Ok(Self {
             lights,
             light_descriptor,
             render_pipeline,
-            models: Models {
-                buffers,
-                models,
-            },
-            materials: Materials {
-                images,
-                sampler,
-                materials,
-            },
+            buffers,
+            models,
+            materials,
         })
+    }
+
+    pub fn vertex_buffer(&mut self) -> &BufferView {
+        &self.buffers[0]
+    }
+
+    pub fn index_buffer(&mut self) -> &BufferView {
+        &self.buffers[1]
     }
 
     pub fn handle_resize(
         &mut self,
         device: &Device,
         camera: &Camera,
-        swapchain: &Swapchain
+        swapchain: &Swapchain,
     ) -> Result<()> {
         self.lights.handle_resize(device, camera, swapchain)
     }
@@ -642,7 +614,7 @@ impl Scene {
         self.lights.destroy(device);
         self.light_descriptor.destroy(device);
         self.materials.destroy(device);
-        self.models.destroy(device);
+        self.buffers.destroy(device);
         self.render_pipeline.destroy(device);
     }
 }
@@ -651,6 +623,9 @@ impl Scene {
 pub struct SceneData {
     pub meshes: Vec<MeshData>,
     pub materials: Vec<MaterialData>,
+
+    pub vertex_data: Vec<u8>,
+    pub index_data: Vec<u8>,
 }
 
 pub struct ImageData {
@@ -662,8 +637,10 @@ pub struct ImageData {
 pub struct MeshData {
     pub material: usize,
     pub transform: Mat4,
-    pub verts: Vec<u8>,
-    pub indices: Vec<u8>,
+
+    pub index_start: u32,
+    pub index_count: u32,
+    pub vertex_start: u32,
 }
 
 pub struct MaterialData {
