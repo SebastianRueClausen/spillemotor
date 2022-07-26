@@ -1,5 +1,3 @@
-use std::{mem, slice};
-
 /// Kernighans algorithm.
 #[inline]
 fn is_pow2(a: u64) -> bool {
@@ -37,19 +35,6 @@ pub fn gcd(mut a: u64, mut b: u64) -> u64 {
 pub fn align_up_to(a: u64, alignment: u64) -> u64 {
     ((a + alignment - 1) / alignment) * alignment
 }
-
-/// Marker trait to mark structs as plain old data.
-pub unsafe trait Pod: Sized {}
-
-pub fn bytes_of<T: Pod>(t: &T) -> &[u8] {
-    unsafe {
-        slice::from_raw_parts(t as *const T as *const u8, mem::size_of::<T>())
-    }
-}
-
-unsafe impl Pod for glam::Mat4 {}
-unsafe impl Pod for glam::Vec3 {}
-unsafe impl Pod for glam::Vec4 {}
 
 #[test]
 fn test_lcm() {

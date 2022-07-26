@@ -3,8 +3,11 @@
 
 #include "cluster_general.glsl"
 
-#define DEBUG
 #define CLUSTERED
+
+#ifdef DEBUG
+#include "cluster_debug.glsl"
+#endif
 
 const float PI = 3.14159265358979323846264;
 
@@ -51,20 +54,12 @@ layout (location = 5) in float in_view_z;
 
 layout (location = 0) out vec4 out_color;
 
-// Specular distribution.
-//
-// This describes the distribution of microfacets of the surface. The algorithm is based on
-// trowbridge-reitz.
 float distribution(float normal_dot_half, float roughness) {
 	float a = roughness * roughness;
 	float f = (normal_dot_half * a - normal_dot_half) * normal_dot_half + 1.0;
 	return a / (PI * f * f);
 }
 
-// Calculate geometric occlusion.
-//
-// Geometric occlusion is the shadowing from the microfacets of the surface. Basically rough
-// surfaces reflects less light back.
 float geometric_occlusion(float normal_dot_view, float normal_dot_light, float roughness) {
 	float a = roughness;
 	float light = normal_dot_light / (normal_dot_view * (1.0 - a) + a);
@@ -77,9 +72,6 @@ float pow5(float val) {
 	return val * val * val * val * val;
 }
 
-// The fresnel function.
-//
-// This calculates the amount of light that reflects from a surface at an incident.
 vec3 fresnel(float light_dot_half, vec3 f0) {
 	float f = pow5(1.0 - light_dot_half);
 	return f + f0 * (1.0 - f);
@@ -131,6 +123,22 @@ vec3 aces_approx(vec3 color) {
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0f, 1.0f);
 }
 
+// Specular antialiasing.
+//
+// Source: http://www.jp.square-enix.com/tech/library/pdf/ImprovedGeometricSpecularAA.pdf
+float specular_aa(vec3 normal, float roughness) {
+    const float SIGMA2 = 0.25;
+    const float KAPPA  = 0.18;
+
+	vec3 dndu = dFdx(normal);
+    vec3 dndv = dFdy(normal);
+
+    float variance = SIGMA2 * (dot(dndu, dndu) + dot(dndv, dndv));
+    float kernel_roughness = min(2.0 * variance, KAPPA);
+
+    return clamp(roughness + kernel_roughness, 0.0, 1.0);
+}
+
 uvec3 cluster_coords(vec2 coords, float view_z) {
 	uvec2 ij = uvec2(coords / cluster_info.cluster_size.xy);
 	uint k = uint(log(-view_z) * cluster_info.depth_factors.x - cluster_info.depth_factors.y);
@@ -143,54 +151,6 @@ uint cluster_index(uvec3 coords) {
 		+ coords.x;
 }
 
-#ifdef DEBUG
-
-vec3 hsv2rgb(vec3 c) {
-  vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
-  vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
-  return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
-}
-
-float rand(vec2 co){
-    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
-}
-
-vec4 debug_cluster_overlay(vec4 background, uvec3 cluster_coords, uint lights_in_cluster) {
-    float cluster_overlay_alpha = 0.3;
-
-	/*
-	uint z_slice = cluster_coords.z;
-    // A hack to make the colors alternate a bit more
-    if ((z_slice & 1u) == 1u) {
-        z_slice = z_slice + cluster_info.subdivisions.z / 2u;
-    }
-    vec3 slice_color = hsv2rgb(vec3(float(z_slice) / float(cluster_info.subdivisions.z + 1u), 1.0, 0.5));
-
-	background = vec4(
-        (1.0 - cluster_overlay_alpha) * background.rgb + cluster_overlay_alpha * slice_color,
-        background.a
-    );
-
-	uint cluster_index = cluster_index(cluster_coords);
-
-    vec3 cluster_color = hsv2rgb(vec3(rand(vec2(cluster_index)), 1.0, 0.5));
-    background = vec4(
-        (1.0 - cluster_overlay_alpha) * background.rgb + cluster_overlay_alpha * cluster_color,
-        background.a
-    );
-
-    float max_light_complexity_per_cluster = 1.0;
-    background.r = (1.0 - cluster_overlay_alpha) * background.r
-        + cluster_overlay_alpha * smoothstep(0.0, max_light_complexity_per_cluster, float(lights_in_cluster));
-    background.g = (1.0 - cluster_overlay_alpha) * background.g
-        + cluster_overlay_alpha * (1.0 - smoothstep(0.0, max_light_complexity_per_cluster, float(lights_in_cluster)));
-	*/
-
-	return background;
-}
-
-#endif
-
 void main() {
 	vec4 color = texture(base_color_sampler, in_texcoord);
 	vec3 normal = texture(normal_sampler, in_texcoord).rgb * 2.0 - 1.0;
@@ -202,14 +162,13 @@ void main() {
 			+ normal.z * normalize(in_world_normal)
 	);
 
-	vec3 view_dir = normalize(vec3(eye) - vec3(in_world_position));
 	vec3 albedo = color.rgb;
-
 	float metallic = metallic_roughness.r;
-	float roughness = metallic_roughness.g * metallic_roughness.g;
+	float roughness = specular_aa(normal, metallic_roughness.g);
 
 	// Reflectance at normal incidence.	
 	vec3 f0 = mix(vec3(0.04), albedo, metallic);
+	vec3 view_dir = normalize(vec3(eye) - vec3(in_world_position));
 
 	vec3 radiance = brdf(
 		albedo,
@@ -222,10 +181,9 @@ void main() {
 		f0
 	);
 
+#ifdef CLUSTERED
 	uvec3 cluster_coords = cluster_coords(gl_FragCoord.xy, in_view_z);
 	uint cluster_index = cluster_index(cluster_coords);
-
-#ifdef CLUSTERED
 
 	uint light_base = cluster_index * MAX_LIGHTS_IN_CLUSTER;
 	uint light_count = 0;
@@ -264,7 +222,9 @@ void main() {
 	radiance += ambient;
 	out_color = vec4(aces_approx(radiance), 1.0);
 
+#ifdef CLUSTERED
 #ifdef DEBUG
 	out_color = debug_cluster_overlay(out_color, cluster_coords, light_count);
+#endif
 #endif
 }

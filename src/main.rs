@@ -15,7 +15,10 @@ mod core;
 mod util;
 mod scene;
 mod light;
+mod text;
+
 mod gltf_import;
+mod font_import;
 
 use anyhow::Result;
 
@@ -38,7 +41,6 @@ fn main() -> Result<()> {
 
     let mut minimized = false;
 
-    let mut last_draw = Instant::now();
     let mut last_update = Instant::now();
 
     let mut renderer = Renderer::new(&window)?;
@@ -80,19 +82,17 @@ fn main() -> Result<()> {
             }
         }
         Event::RedrawRequested(_) => {
-            println!("frame time: {} ms", last_draw.elapsed().as_millis());
-
-            last_draw = Instant::now();
-
             if !minimized && !renderer.draw().expect("failed drawing to the screen") {
                 warn!("out of data surface when trying to draw");
             }
         }
         Event::MainEventsCleared => {
-            renderer.scene.update(&mut input_state, last_update.elapsed());
+            renderer.update(&mut input_state, last_update.elapsed());
             last_update = Instant::now();
 
-            if let Some(left) = Duration::from_millis(16).checked_sub(last_draw.elapsed()) {
+            if let Some(left) = Duration::from_millis(16)
+                .checked_sub(renderer.elapsed_since_last_frame())
+            {
                 trace!("sleep for {left:?}");
                 *controlflow = ControlFlow::WaitUntil(Instant::now() + left);
             } else {

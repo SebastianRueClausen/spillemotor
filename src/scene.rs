@@ -4,15 +4,24 @@ use ash::vk;
 
 use std::mem;
 use std::ops::Index;
-use std::time::Duration;
 
-use crate::util;
-use crate::camera::{InputState, Camera};
+use crate::camera::Camera;
 use crate::light::{PointLight, Lights};
-use crate::core::{Device, Swapchain, RenderPass, RenderTargets, Pipeline};
-use crate::core::{DescriptorSet, DescriptorBinding, BindingKind, DescriptorLayoutCache};
-use crate::core::CameraUniforms;
-use crate::resource::{Images, Buffers};
+use crate::core::{
+    Device,
+    Swapchain,
+    RenderPass,
+    RenderTargets,
+    Pipeline,
+    ShaderModule,
+    PipelineRequest,
+    DescriptorSet,
+    DescriptorBinding,
+    BindingKind,
+    DescriptorLayoutCache,
+    CameraUniforms,
+};
+use crate::resource::{self, Images, Buffers};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -24,6 +33,7 @@ pub struct Vertex {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 pub struct ModelTransform {
     #[allow(dead_code)]
     transform: Mat4,
@@ -31,8 +41,6 @@ pub struct ModelTransform {
     #[allow(dead_code)]
     inverse_transpose_transform: Mat4,
 }
-
-unsafe impl util::Pod for ModelTransform {}
 
 pub struct Model {
     pub index_buffer: usize,
@@ -126,10 +134,6 @@ impl Materials {
 
 pub struct Scene {
     pub lights: Lights,
-    pub camera: Camera,
-
-    camera_uniforms: CameraUniforms,
-
     pub render_pipeline: Pipeline,
     pub light_descriptor: DescriptorSet,
     pub materials: Materials,
@@ -143,11 +147,10 @@ impl Scene {
         swapchain: &Swapchain,
         render_pass: &RenderPass,
         render_targets: &RenderTargets,
+        camera_uniforms: &CameraUniforms,
+        camera: &Camera,
         scene_data: &SceneData,
     ) -> Result<Self> {
-        let camera = Camera::new(swapchain.aspect_ratio());
-        let camera_uniforms = CameraUniforms::new(device, &camera, swapchain)?;
-
         let mut lights = Vec::default();
 
         for i in 0..100 {
@@ -241,7 +244,6 @@ impl Scene {
                     .dst_offset(0)
                     .size(src.size())
                     .build()];
-
                 unsafe {
                     device.handle.cmd_copy_buffer(
                         command_buffer,
@@ -348,6 +350,7 @@ impl Scene {
                             .format(format)
                             .build()
                     }
+
                     [
                         view_info(vk::Format::R8G8B8A8_SRGB),
                         view_info(vk::Format::R8G8B8A8_UNORM),
@@ -359,7 +362,7 @@ impl Scene {
             Images::new(device, &image_infos, &view_infos, vk::MemoryPropertyFlags::DEVICE_LOCAL)?
         };
 
-        for image in images.images.iter_mut() {
+        for image in images.iter_mut() {
             image.transition_layout(device, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
         }
 
@@ -396,7 +399,7 @@ impl Scene {
 
         unsafe { staging.destroy(device); }
 
-        for image in images.images.iter_mut() {
+        for image in images.iter_mut() {
             image.transition_layout(device, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
         }
 
@@ -446,7 +449,7 @@ impl Scene {
             },
         ])?;
 
-        let sampler = create_texture_sampler(device)?;
+        let sampler = resource::create_texture_sampler(device)?;
         let materials: Result<Vec<_>> = scene_data.materials
             .iter()
             .enumerate()
@@ -535,20 +538,79 @@ impl Scene {
                 .descriptor
                 .layout;
 
-            Pipeline::new_render(
-                device,
+            let vertex_code = include_bytes_aligned_as!(u32, "../shaders/vert.spv");
+            let fragment_code = include_bytes_aligned_as!(u32, "../shaders/frag.spv");
+
+            let vertex_module = ShaderModule::new(&device, "main", vertex_code)?;
+            let fragment_module = ShaderModule::new(&device, "main", fragment_code)?;
+
+            let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::builder()
+                .depth_test_enable(true)
+                .depth_write_enable(true)
+                .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+
+            let pipeline = Pipeline::new(device, PipelineRequest::Render {
+                descriptor_layouts: &[
+                    descriptor_layout,
+                    light_descriptor.layout,
+                ],
+                push_constants: &[
+                    vk::PushConstantRange::builder()
+                        .stage_flags(vk::ShaderStageFlags::VERTEX)
+                        .size(mem::size_of::<ModelTransform>() as u32)
+                        .offset(0)
+                        .build(),
+                ],
+                vertex_attributes: &[
+                    vk::VertexInputAttributeDescription {
+                        format: vk::Format::R32G32B32_SFLOAT,
+                        binding: 0,
+                        location: 0,
+                        offset: 0,
+                    },
+                    vk::VertexInputAttributeDescription {
+                        format: vk::Format::R32G32B32_SFLOAT,
+                        binding: 0,
+                        location: 1,
+                        offset: mem::size_of::<Vec3>() as u32,
+                    },
+                    vk::VertexInputAttributeDescription {
+                        format: vk::Format::R32G32_SFLOAT,
+                        binding: 0,
+                        location: 2,
+                        offset: mem::size_of::<[Vec3; 2]>() as u32
+                    },
+                    vk::VertexInputAttributeDescription {
+                        format: vk::Format::R32G32B32A32_SFLOAT,
+                        binding: 0,
+                        location: 3,
+                        offset: (mem::size_of::<[Vec3; 2]>() + mem::size_of::<Vec2>())as u32,
+                    },
+                ],
+                vertex_bindings: &[vk::VertexInputBindingDescription {
+                    binding: 0,
+                    stride: mem::size_of::<Vertex>() as u32,
+                    input_rate: vk::VertexInputRate::VERTEX,
+                }],
+                depth_stencil_info: &depth_stencil_info,
+                vertex_shader: &vertex_module,
+                fragment_shader: &fragment_module,
                 swapchain,
                 render_pass,
                 render_targets,
-                &[descriptor_layout, light_descriptor.layout],
-            )?
+            })?;
+
+            unsafe {
+                vertex_module.destroy(device); 
+                fragment_module.destroy(device); 
+            }
+
+            pipeline
         };
 
         Ok(Self {
-            camera,
             lights,
             light_descriptor,
-            camera_uniforms,
             render_pipeline,
             models: Models {
                 buffers,
@@ -562,18 +624,13 @@ impl Scene {
         })
     }
 
-    pub fn update(&mut self, input_state: &mut InputState, dt: Duration) {
-        self.camera.update(input_state, dt); 
-    }
-
-    pub fn handle_resize(&mut self, device: &Device, swapchain: &Swapchain) -> Result<()> {
-        self.camera.update_proj(swapchain.aspect_ratio());
-        self.camera_uniforms.update_proj(&self.camera, swapchain);
-        self.lights.handle_resize(device, &self.camera, swapchain)
-    }
-
-    pub fn upload_data(&mut self, frame_index: usize) {
-        self.camera_uniforms.update_view(frame_index, &self.camera);
+    pub fn handle_resize(
+        &mut self,
+        device: &Device,
+        camera: &Camera,
+        swapchain: &Swapchain
+    ) -> Result<()> {
+        self.lights.handle_resize(device, camera, swapchain)
     }
 
     /// Destroy and leave `self` in an invalid state.
@@ -584,33 +641,10 @@ impl Scene {
     pub unsafe fn destroy(&self, device: &Device) {
         self.lights.destroy(device);
         self.light_descriptor.destroy(device);
-        self.camera_uniforms.destroy(device);
         self.materials.destroy(device);
         self.models.destroy(device);
         self.render_pipeline.destroy(device);
     }
-}
-
-fn create_texture_sampler(device: &Device) -> Result<vk::Sampler> {
-    let create_info = vk::SamplerCreateInfo::builder()
-        .mag_filter(vk::Filter::LINEAR)
-        .min_filter(vk::Filter::LINEAR)
-        .address_mode_u(vk::SamplerAddressMode::REPEAT)
-        .address_mode_v(vk::SamplerAddressMode::REPEAT)
-        .address_mode_w(vk::SamplerAddressMode::REPEAT)
-        .anisotropy_enable(true)
-        .max_anisotropy(device.device_properties.limits.max_sampler_anisotropy)
-        .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
-        .unnormalized_coordinates(false)
-        .compare_enable(false)
-        .compare_op(vk::CompareOp::ALWAYS)
-        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-        .mip_lod_bias(0.0)
-        .min_lod(0.0)
-        .max_lod(0.0);
-    Ok(unsafe {
-        device.handle.create_sampler(&create_info, None)?
-    })
 }
 
 #[derive(Default)]

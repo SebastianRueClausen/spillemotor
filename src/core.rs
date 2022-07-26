@@ -1,18 +1,20 @@
 use anyhow::Result;
 use ash::extensions::{ext, khr};
 use ash::vk;
-use glam::{Mat4, Vec3, Vec4, Vec2};
+use glam::{Mat4, Vec4, Vec3, Vec2};
 use smallvec::SmallVec;
 
 use std::ffi::{self, CStr, CString};
 use std::path::Path;
 use std::{iter, mem, ops, hash};
+use std::time::{Instant, Duration};
 use std::collections::HashMap;
 
-use crate::camera::Camera;
+use crate::camera::{InputState, Camera};
 use crate::resource::{Buffers, BufferView, Image, Images, MappedMemory};
-use crate::scene::{ModelTransform, Scene, Vertex};
-use crate::{gltf_import, util};
+use crate::scene::Scene;
+use crate::{gltf_import, font_import};
+use crate::text::TextPass;
 
 pub struct Renderer {
     device: Device,
@@ -21,7 +23,11 @@ pub struct Renderer {
     frame_queue: FrameQueue,
     render_targets: RenderTargets,
     descriptor_layout_cache: DescriptorLayoutCache,
+    text_pass: TextPass,
+    camera_uniforms: CameraUniforms,
+    camera: Camera,
     pub scene: Scene,
+    last_draw: Instant, 
 }
 
 impl Renderer {
@@ -38,7 +44,9 @@ impl Renderer {
 
         let mut descriptor_layout_cache = DescriptorLayoutCache::default();
 
-        // let scene_data = gltf_import::load(Path::new("models/duck/Duck0.gltf"))?;
+        let camera = Camera::new(swapchain.aspect_ratio());
+        let camera_uniforms = CameraUniforms::new(&device, &camera, &swapchain)?;
+
         let scene_data = gltf_import::load(Path::new("models/sponza/Sponza.gltf"))?;
 
         let scene = Scene::from_scene_data(
@@ -47,18 +55,37 @@ impl Renderer {
             &swapchain,
             &render_pass,
             &render_targets,
+            &camera_uniforms,
+            &camera,
             &scene_data,
         )?;
+
+        let font = font_import::FontData::new(Path::new("fonts/source_code_pro/metadata.json"))?;
+
+        let text_pass = TextPass::new(
+            &device,
+            &mut descriptor_layout_cache,
+            &swapchain,
+            &render_pass,
+            &render_targets,
+            &font,
+        )?;
+    
+        let last_draw = Instant::now();
 
         device.wait_until_idle();
 
         Ok(Self {
+            last_draw,
+            text_pass,
             device,
             swapchain,
             render_pass,
             frame_queue,
             render_targets,
             descriptor_layout_cache,
+            camera,
+            camera_uniforms,
             scene,
         })
     }
@@ -77,7 +104,7 @@ impl Renderer {
             self.device.handle.reset_command_buffer(frame.command_buffer, reset_flags)?;
         }
 
-        self.scene.upload_data(frame.index);
+        self.camera_uniforms.update_view(frame.index, &self.camera);
 
         let next_image = unsafe {
             self.swapchain.loader.acquire_next_image(
@@ -91,6 +118,9 @@ impl Renderer {
         match next_image {
             // Getting the next image succeded and the swapchain is optimal.
             Ok((image_index, false)) => {
+                let elapsed = self.last_draw.elapsed();
+                self.last_draw = Instant::now();
+
                 // Reset the frame now that we have acquired the image successfully.
                 unsafe {
                     self.device.handle.reset_fences(&[frame.ready_to_draw])?;
@@ -302,7 +332,7 @@ impl Renderer {
                             self.scene.render_pipeline.layout,
                             vk::ShaderStageFlags::VERTEX,
                             0,
-                            util::bytes_of(model.transform()),
+                            bytemuck::bytes_of(model.transform()),
                         );
 
                         self.device.handle.cmd_draw_indexed(
@@ -314,6 +344,14 @@ impl Renderer {
                             0,
                         );
                     }
+
+                    self.text_pass.draw_text(&self.device, &self.swapchain, &frame, |obj| {
+                        obj.add_label(
+                            40.0,
+                            Vec3::new(20.0, 20.0, 0.5),
+                            &format!("fps: {}", 1000 / elapsed.as_millis()),
+                        );
+                    })?;
 
                     self.device.handle.cmd_end_render_pass(frame.command_buffer);
                     self.device.handle.end_command_buffer(frame.command_buffer)?;
@@ -366,6 +404,10 @@ impl Renderer {
         }
     }
 
+    pub fn update(&mut self, input_state: &mut InputState, dt: Duration) {
+        self.camera.update(input_state, dt); 
+    }
+
     /// Handle window resize. The extent of the swapchain and framebuffers will we match that of
     /// `window`.
     pub fn resize(&mut self, window: &winit::window::Window) -> Result<()> {
@@ -387,11 +429,18 @@ impl Renderer {
         self.render_targets = RenderTargets::new(&self.device, &self.swapchain)?;
         self.render_pass = RenderPass::new(&self.device, &self.swapchain, &self.render_targets)?;
 
-        self.scene.handle_resize(&self.device, &self.swapchain)?;
+        self.camera.update_proj(self.swapchain.aspect_ratio());
+        self.camera_uniforms.update_proj(&self.camera, &self.swapchain);
 
+        self.text_pass.handle_resize(&self.swapchain);
+        self.scene.handle_resize(&self.device, &self.camera, &self.swapchain)?;
         self.device.wait_until_idle();
 
         Ok(())
+    }
+
+    pub fn elapsed_since_last_frame(&self) -> Duration {
+        self.last_draw.elapsed()
     }
 }
 
@@ -405,7 +454,9 @@ impl Drop for Renderer {
             self.render_pass.destroy(&self.device);
             self.swapchain.destroy(&self.device);
             self.descriptor_layout_cache.destroy(&self. device);
+            self.camera_uniforms.destroy(&self.device);
             self.scene.destroy(&self.device);
+            self.text_pass.destroy(&self.device);
             self.device.destroy();
         }
     }
@@ -786,7 +837,7 @@ pub struct RenderPass {
     ///
     /// Maybe use dynamic rendering instead.
     ///
-    /// # Example 1
+    /// # Example
     ///
     /// Let's say the system gives 4 swapchain images and we have 2 images in flight, the
     /// framebuffers looks as follows.
@@ -965,9 +1016,9 @@ pub struct Frame {
 
     /// Command buffer to for drawing and transfers. This has to be re-recorded before each frame,
     /// since the amount of frames (most likely) doesn't match the number if swapchain images.
-    command_buffer: vk::CommandBuffer,
+    pub command_buffer: vk::CommandBuffer,
 
-    index: usize,
+    pub index: usize,
 }
 
 impl Frame {
@@ -1068,12 +1119,12 @@ impl Surface {
         use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
         let handle = match window.raw_window_handle() {
             #[cfg(target_os = "windows")]
-            RawWindowHandle::Windows(handle) => {
+            RawWindowHandle::Win32(handle) => {
                 let info = vk::Win32SurfaceCreateInfoKHR::default()
                     .hinstance(handle.hinstance)
                     .hwnd(handle.hwnd);
                 let loader = khr::Win32Surface::new(entry, instance);
-                unsafe { loader.create_win32_surface(&info, allocation_callbacks) }
+                unsafe { loader.create_win32_surface(&info, None) }
             }
 
             #[cfg(target_os = "linux")]
@@ -1453,7 +1504,7 @@ impl Swapchain {
         self.images.len() as u32
     }
 
-    fn viewports(&self) -> [vk::Viewport; 1] {
+    pub fn viewports(&self) -> [vk::Viewport; 1] {
         [vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -1464,7 +1515,7 @@ impl Swapchain {
         }]
     }
 
-    fn scissors(&self) -> [vk::Rect2D; 1] {
+    pub fn scissors(&self) -> [vk::Rect2D; 1] {
         [vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: self.extent,
@@ -1492,7 +1543,7 @@ impl Swapchain {
 /// Data related to the camera view. This is updated every frame and has a copy per frame in
 /// flight.
 #[repr(C)]
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default, bytemuck::NoUninit)]
 pub struct ViewUniform {
     /// The position of the camera in world space.
     eye: Vec4,
@@ -1508,8 +1559,6 @@ pub struct ViewUniform {
     proj_view: Mat4,
 }
 
-unsafe impl util::Pod for ViewUniform {}
-
 impl ViewUniform {
     pub fn new(camera: &Camera) -> Self {
         let eye = Vec4::from((camera.pos, 0.0));
@@ -1523,7 +1572,7 @@ impl ViewUniform {
 /// Data related to the projection matrix. This is only updated on screen resize or camera settings
 /// changes. There is only one copy.
 #[repr(C)]
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default, bytemuck::NoUninit)]
 pub struct ProjUniform {
     /// The projection matrix.
     proj: Mat4,
@@ -1536,8 +1585,6 @@ pub struct ProjUniform {
     /// z near and z far.
     z_plane: Vec2,
 }
-
-unsafe impl util::Pod for ProjUniform {}
 
 impl ProjUniform {
     pub fn new(camera: &Camera, swapchain: &Swapchain) -> Self {
@@ -1612,7 +1659,7 @@ impl CameraUniforms {
         let range = self.buffers[1 + frame_index].range.clone();
 
         unsafe {
-            self.mapped.get_range(range).copy_from_slice(util::bytes_of(&view));
+            self.mapped.get_range(range).copy_from_slice(bytemuck::bytes_of(&view));
         }
     }
 
@@ -1621,7 +1668,7 @@ impl CameraUniforms {
         let range = self.buffers[0].range.clone();
 
         unsafe {
-            self.mapped.get_range(range).copy_from_slice(util::bytes_of(&proj));
+            self.mapped.get_range(range).copy_from_slice(bytemuck::bytes_of(&proj));
         }
     }
 
@@ -1911,197 +1958,158 @@ impl DescriptorSet {
     }
 }
 
+pub enum PipelineRequest<'a> {
+    Render {
+        descriptor_layouts: &'a [vk::DescriptorSetLayout],
+        push_constants: &'a [vk::PushConstantRange],
+        vertex_attributes: &'a [vk::VertexInputAttributeDescription],
+        vertex_bindings: &'a [vk::VertexInputBindingDescription],
+        depth_stencil_info: &'a vk::PipelineDepthStencilStateCreateInfo,
+        vertex_shader: &'a ShaderModule,
+        fragment_shader: &'a ShaderModule,
+        swapchain: &'a Swapchain,
+        render_pass: &'a RenderPass,
+        render_targets: &'a RenderTargets,   
+    },
+    Compute {
+        descriptors: &'a [&'a DescriptorSet],
+        push_constants: &'a [vk::PushConstantRange],
+        shader: &'a ShaderModule,
+    }
+}
+
 pub struct Pipeline {
     pub handle: vk::Pipeline,
     pub layout: vk::PipelineLayout,
 }
 
 impl Pipeline {
-    pub fn new_compute(
-        device: &Device,
-        shader: &ShaderModule,
-        descriptors: &[&DescriptorSet],
-        push_constants: &[vk::PushConstantRange],
-    ) -> Result<Self> {
-        let layout = unsafe {
-            let layouts: SmallVec<[_; 4]> = descriptors
-                .iter()
-                .map(|desc| desc.layout)
-                .collect();
-            let info = vk::PipelineLayoutCreateInfo::builder()
-                .push_constant_ranges(&push_constants)
-                .set_layouts(&layouts);
-            device.handle.create_pipeline_layout(&info, None)?
-        };
-        let stage = shader.stage_create_info(vk::ShaderStageFlags::COMPUTE);
-        let create_infos = [vk::ComputePipelineCreateInfo::builder()
-            .layout(layout)
-            .stage(*stage)
-            .build()];
-        let handle = unsafe {
-            device.handle
-                .create_compute_pipelines(vk::PipelineCache::null(), &create_infos, None)
-                .map_err(|(_, err)| err)?
-                .first()
-                .unwrap()
-                .clone()
-        };
-        Ok(Self { handle, layout })
-    }
+    pub fn new(device: &Device, request: PipelineRequest) -> Result<Self> {
+        match request {
+            PipelineRequest::Render {
+                descriptor_layouts,
+                push_constants,
+                vertex_attributes,
+                vertex_bindings,
+                depth_stencil_info,
+                vertex_shader,
+                fragment_shader,
+                swapchain,
+                render_pass,
+                render_targets,
+            } => {
+                let shader_stages = [
+                    *vertex_shader.stage_create_info(vk::ShaderStageFlags::VERTEX),
+                    *fragment_shader.stage_create_info(vk::ShaderStageFlags::FRAGMENT),
+                ];
 
-    pub fn new_render(
-        device: &Device,
-        swapchain: &Swapchain,
-        render_pass: &RenderPass,
-        render_targets: &RenderTargets,
-        descriptor_layouts: &[vk::DescriptorSetLayout],
-    ) -> Result<Self> {
-        let vertex_module = ShaderModule::new(
-            &device,
-            "main",
-            include_bytes_aligned_as!(u32, "../shaders/vert.spv"),
-        )?;
-        let fragment_module = ShaderModule::new(
-            &device,
-            "main",
-            include_bytes_aligned_as!(u32, "../shaders/frag.spv"),
-        )?;
-        let shader_stages = [
-            *vertex_module.stage_create_info(vk::ShaderStageFlags::VERTEX),
-            *fragment_module.stage_create_info(vk::ShaderStageFlags::FRAGMENT),
-        ];
-        let vert_attrib = [
-            // Positions
-            vk::VertexInputAttributeDescription {
-                format: vk::Format::R32G32B32_SFLOAT,
-                binding: 0,
-                location: 0,
-                offset: 0,
-            },
-            // Normals
-            vk::VertexInputAttributeDescription {
-                format: vk::Format::R32G32B32_SFLOAT,
-                binding: 0,
-                location: 1,
-                offset: mem::size_of::<Vec3>() as u32,
-            },
-            // Texcoords
-            vk::VertexInputAttributeDescription {
-                format: vk::Format::R32G32_SFLOAT,
-                binding: 0,
-                location: 2,
-                offset: mem::size_of::<[Vec3; 2]>() as u32
-            },
-            // Tangents
-            vk::VertexInputAttributeDescription {
-                format: vk::Format::R32G32B32A32_SFLOAT,
-                binding: 0,
-                location: 3,
-                offset: (mem::size_of::<[Vec3; 2]>() + mem::size_of::<Vec2>())as u32,
-            },
-        ];
+                let vert_input_info = vk::PipelineVertexInputStateCreateInfo::builder()
+                    .vertex_attribute_descriptions(&vertex_attributes)
+                    .vertex_binding_descriptions(&vertex_bindings);
 
-        let vert_binding = [vk::VertexInputBindingDescription {
-            binding: 0,
-            stride: mem::size_of::<Vertex>() as u32,
-            input_rate: vk::VertexInputRate::VERTEX,
-        }];
+                let vert_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
+                    .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
-        let vert_input_info = vk::PipelineVertexInputStateCreateInfo::builder()
-            .vertex_attribute_descriptions(&vert_attrib)
-            .vertex_binding_descriptions(&vert_binding);
+                let viewports = swapchain.viewports();
+                let scissors = swapchain.scissors();
 
-        let vert_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
-            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+                let viewport_info = vk::PipelineViewportStateCreateInfo::builder()
+                    .viewports(&viewports)
+                    .scissors(&scissors);
+                let rasterize_info = vk::PipelineRasterizationStateCreateInfo::builder()
+                    .line_width(1.0)
+                    .front_face(vk::FrontFace::CLOCKWISE)
+                    .cull_mode(vk::CullModeFlags::BACK)
+                    .polygon_mode(vk::PolygonMode::FILL);
+                let multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
+                    .rasterization_samples(render_targets.sample_count);
+                let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::builder()
+                    .blend_enable(true)
+                    .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                    .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .color_blend_op(vk::BlendOp::ADD)
+                    .src_alpha_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                    .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .alpha_blend_op(vk::BlendOp::ADD)
+                    .color_write_mask(
+                        vk::ColorComponentFlags::R
+                            | vk::ColorComponentFlags::G
+                            | vk::ColorComponentFlags::B
+                            | vk::ColorComponentFlags::A,
+                    )
+                    .build()];
 
-        let viewports = swapchain.viewports();
-        let scissors = swapchain.scissors();
+                let color_blend_info =
+                    vk::PipelineColorBlendStateCreateInfo::builder().attachments(&color_blend_attachments);
 
-        let viewport_info = vk::PipelineViewportStateCreateInfo::builder()
-            .viewports(&viewports)
-            .scissors(&scissors);
-        let rasterize_info = vk::PipelineRasterizationStateCreateInfo::builder()
-            .line_width(1.0)
-            .front_face(vk::FrontFace::CLOCKWISE)
-            .cull_mode(vk::CullModeFlags::BACK)
-            .polygon_mode(vk::PolygonMode::FILL);
-        let multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
-            .rasterization_samples(render_targets.sample_count);
-        let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::builder()
-            .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::SRC_ALPHA)
-            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .alpha_blend_op(vk::BlendOp::ADD)
-            .color_write_mask(
-                vk::ColorComponentFlags::R
-                    | vk::ColorComponentFlags::G
-                    | vk::ColorComponentFlags::B
-                    | vk::ColorComponentFlags::A,
-            )
-            .build()];
+                let layout = unsafe {
+                    let info = vk::PipelineLayoutCreateInfo::builder()
+                        .set_layouts(&descriptor_layouts)
+                        .push_constant_ranges(&push_constants);
+                    device.handle.create_pipeline_layout(&info, None)?
+                };
 
-        let color_blend_info =
-            vk::PipelineColorBlendStateCreateInfo::builder().attachments(&color_blend_attachments);
+                let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+                let dynamic_state =
+                    vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_states);
+                let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+                    .dynamic_state(&dynamic_state)
+                    .stages(&shader_stages)
+                    .vertex_input_state(&vert_input_info)
+                    .input_assembly_state(&vert_assembly_info)
+                    .viewport_state(&viewport_info)
+                    .rasterization_state(&rasterize_info)
+                    .multisample_state(&multisample_info)
+                    .depth_stencil_state(&depth_stencil_info)
+                    .color_blend_state(&color_blend_info)
+                    .layout(layout)
+                    .render_pass(render_pass.handle)
+                    .subpass(0);
 
-        let push_constant_ranges = [
-            vk::PushConstantRange::builder()
-                .stage_flags(vk::ShaderStageFlags::VERTEX)
-                .size(mem::size_of::<ModelTransform>() as u32)
-                .offset(0)
-                .build(),
-        ];
+                let handle = unsafe {
+                    *device.handle
+                        .create_graphics_pipelines(
+                            vk::PipelineCache::null(),
+                            &[pipeline_info.build()],
+                            None,
+                        )
+                        .map_err(|(_, error)| anyhow!("failed to create pipeline: {error}"))?
+                        .first()
+                        .unwrap()
+                };
 
-        let layout = unsafe {
-            let info = vk::PipelineLayoutCreateInfo::builder()
-                .set_layouts(&descriptor_layouts)
-                .push_constant_ranges(&push_constant_ranges);
-            device.handle.create_pipeline_layout(&info, None)?
-        };
-
-        let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::builder()
-            .depth_test_enable(true)
-            .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
-        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic_state =
-            vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_states);
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
-            .dynamic_state(&dynamic_state)
-            .stages(&shader_stages)
-            .vertex_input_state(&vert_input_info)
-            .input_assembly_state(&vert_assembly_info)
-            .viewport_state(&viewport_info)
-            .rasterization_state(&rasterize_info)
-            .multisample_state(&multisample_info)
-            .depth_stencil_state(&depth_stencil_info)
-            .color_blend_state(&color_blend_info)
-            .layout(layout)
-            .render_pass(render_pass.handle)
-            .subpass(0);
-
-        let handle = unsafe {
-            *device.handle
-                .create_graphics_pipelines(
-                    vk::PipelineCache::null(),
-                    &[pipeline_info.build()],
-                    None,
-                )
-                .map_err(|(_, error)| anyhow!("failed to create pipeline: {error}"))?
-                .first()
-                .unwrap()
-        };
-
-        unsafe {
-            vertex_module.destroy(device); 
-            fragment_module.destroy(device); 
+                Ok(Self { handle, layout })
+                
+            }
+            PipelineRequest::Compute { descriptors, push_constants, shader } => {
+                let layout = unsafe {
+                    let layouts: SmallVec<[_; 4]> = descriptors
+                        .iter()
+                        .map(|desc| desc.layout)
+                        .collect();
+                    let info = vk::PipelineLayoutCreateInfo::builder()
+                        .push_constant_ranges(&push_constants)
+                        .set_layouts(&layouts);
+                    device.handle.create_pipeline_layout(&info, None)?
+                };
+                let stage = shader.stage_create_info(vk::ShaderStageFlags::COMPUTE);
+                let create_infos = [vk::ComputePipelineCreateInfo::builder()
+                    .layout(layout)
+                    .stage(*stage)
+                    .build()];
+                let handle = unsafe {
+                    device.handle
+                        .create_compute_pipelines(vk::PipelineCache::null(), &create_infos, None)
+                        .map_err(|(_, err)| err)?
+                        .first()
+                        .unwrap()
+                        .clone()
+                };
+                Ok(Self { handle, layout })
+            }
         }
-
-        Ok(Self { handle, layout })
     }
-
+    
     /// Destroy and leave `self` in an invalid state.
     ///
     /// # Safety

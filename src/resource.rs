@@ -530,6 +530,10 @@ impl Images {
         self.images.iter()
     }
 
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Image> {
+        self.images.iter_mut()
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.images.len()
@@ -631,6 +635,29 @@ impl Images {
         self.block.free(device);
     }
 }
+
+pub fn create_texture_sampler(device: &Device) -> Result<vk::Sampler> {
+    let create_info = vk::SamplerCreateInfo::builder()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+        .address_mode_w(vk::SamplerAddressMode::REPEAT)
+        .anisotropy_enable(true)
+        .max_anisotropy(device.device_properties.limits.max_sampler_anisotropy)
+        .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+        .unnormalized_coordinates(false)
+        .compare_enable(false)
+        .compare_op(vk::CompareOp::ALWAYS)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .mip_lod_bias(0.0)
+        .min_lod(0.0)
+        .max_lod(0.0);
+    Ok(unsafe {
+        device.handle.create_sampler(&create_info, None)?
+    })
+}
+
 
 /// Find a memory type index fitting `props`, `flags` and `memory_type_bits`.
 ///

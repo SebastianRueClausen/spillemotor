@@ -6,9 +6,19 @@ use std::{iter, mem};
 
 use crate::camera::Camera;
 use crate::resource::{MappedMemory, Buffers, Buffer, BufferView};
-use crate::core::{Device, Swapchain, Pipeline, ShaderModule, FRAMES_IN_FLIGHT};
-use crate::core::{CameraUniforms, DescriptorSet, DescriptorBinding, BindingKind, DescriptorLayoutCache};
-use crate::util;
+use crate::core::{
+    Device,
+    Swapchain,
+    Pipeline,
+    PipelineRequest,
+    ShaderModule,
+    FRAMES_IN_FLIGHT,
+    CameraUniforms,
+    DescriptorSet,
+    DescriptorBinding,
+    BindingKind,
+    DescriptorLayoutCache,
+};
 
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -82,6 +92,7 @@ struct Aabb {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
 pub struct ClusterInfo {
     /// The number of subdivisions in each axis.
     ///
@@ -125,8 +136,6 @@ impl ClusterInfo {
     }
 }
 
-unsafe impl util::Pod for ClusterInfo {}
-
 pub struct ClusterInfoBuffer {
     pub buffer: Buffer,
     mapped: MappedMemory,
@@ -148,7 +157,7 @@ impl ClusterInfoBuffer {
         let mapped = buffer.block.map(device)?;
         let info = ClusterInfo::new(swapchain, camera);
 
-        unsafe { mapped.get_range(..).copy_from_slice(util::bytes_of(&info)); }
+        unsafe { mapped.get_range(..).copy_from_slice(bytemuck::bytes_of(&info)); }
 
         Ok(Self { buffer, mapped, info })
     }
@@ -157,7 +166,7 @@ impl ClusterInfoBuffer {
         self.info = ClusterInfo::new(swapchain, camera);
          
         unsafe {
-            self.mapped.get_range(..).copy_from_slice(util::bytes_of(&self.info));
+            self.mapped.get_range(..).copy_from_slice(bytemuck::bytes_of(&self.info));
         }
     }
 
@@ -231,9 +240,6 @@ impl ClusterInfoBuffer {
 /// during light culling, but since light culling runs in `O(n * k)` time where n is the number
 /// of lights and `k` the number of clusters, this will hopefully speed things up by reducing the
 /// complexity to `O(n)` but adding an extra memory lookup during culling.
-///
-/// FIXME: Resizing the window technically invalidates every buffer which depend on the amount of
-/// clusters.
 ///
 pub struct Lights {
     pub buffers: Buffers,
@@ -362,7 +368,11 @@ impl Lights {
             let code = include_bytes_aligned_as!(u32, "../shaders/cluster_build.spv");
             let shader = ShaderModule::new(device, "main", code)?;
 
-            let pipeline = Pipeline::new_compute(device, &shader, &[&descriptor], &[])?;
+            let pipeline = Pipeline::new(device, PipelineRequest::Compute {
+                descriptors: &[&descriptor], 
+                push_constants: &[],
+                shader: &shader,
+            })?;
 
             unsafe { shader.destroy(device); }
 
@@ -396,7 +406,11 @@ impl Lights {
             let code = include_bytes_aligned_as!(u32, "../shaders/light_update.spv");
             let shader = ShaderModule::new(device, "main", code)?;
 
-            let pipeline = Pipeline::new_compute(device, &shader, &[&descriptor], &[])?;
+            let pipeline = Pipeline::new(device, PipelineRequest::Compute {
+                descriptors: &[&descriptor], 
+                push_constants: &[],
+                shader: &shader,
+            })?;
 
             unsafe { shader.destroy(device); }
 
@@ -434,7 +448,11 @@ impl Lights {
             let code = include_bytes_aligned_as!(u32, "../shaders/cluster_update.spv");
             let shader = ShaderModule::new(device, "main", code)?;
 
-            let pipeline = Pipeline::new_compute(device, &shader, &[&descriptor], &[])?;
+            let pipeline = Pipeline::new(device, PipelineRequest::Compute {
+                descriptors: &[&descriptor], 
+                push_constants: &[],
+                shader: &shader,
+            })?;
 
             unsafe { shader.destroy(device); }
 
