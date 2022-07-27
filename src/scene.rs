@@ -407,8 +407,8 @@ impl Scene {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
                 kind: BindingKind::Buffer([
-                    lights.light_index_buffer(0), 
-                    lights.light_index_buffer(1), 
+                    lights.light_mask_buffer(0), 
+                    lights.light_mask_buffer(1), 
                 ]),
             },
         ])?;

@@ -175,6 +175,11 @@ impl ClusterInfoBuffer {
     }
 }
 
+#[repr(C)]
+struct LightMask {
+    bits: [u32; MAX_LIGHT_COUNT.div_ceil(32)]
+}
+
 /// Pipelines and buffers used to implement clustered shading as described in the paper.
 /// "clustered deferred and forward shading - Ola Olsson, Markus Billeter and Ulf Assarsson".
 ///
@@ -216,22 +221,18 @@ impl ClusterInfoBuffer {
 /// This holds an [`Aabb`] for each cluster in the view fustrum. This one is created at startup and
 /// recreated if the resolution changes.
 ///
-/// ## Light index buffer
+/// ## Light mask buffer
 ///
-/// A list of indices to lights in each cluster. Each cluster has it's own slice of
-/// `LIGHTS_PER_CLUSTER` indices. The offset into the list for cluster with index k is calculated
-/// as `LIGHTS_PER_CLUSTER * k`. If less than `LIGHTS_PER_CLUSTER` lights are in the cluster, then
-/// the end is marked with an terminal invalid index.
+/// A list of [`LightMask`] for each cluster. This is updated each frame before starting the
+/// shading pass. It has one copy per frame in flight.
 ///
 /// This buffer has a copy for each frame in flight and is updated before drawing each frame by
 /// the `cluster_update` compute shader.
 //
-/// This is one of two main ways of doing this. Another way would be to have another buffer with
-/// info for each cluster, with the base offset into this buffer and the amount of lights. It could
-/// have some advantages if we add support for another type of light, like flood lights.
-///
-/// It could perhaps also have some performance improvements as the indices would be denser in
-/// memory, but that would also add one more layer of indirection in the fragment shader.
+/// This is one of two main ways of doing this. Another way would be to have some kind of light
+/// list where each cluster get's it's own slice of light indices. This would work as well, but
+/// would take up more a lot more memory unless you start doing heuristics about how many lights
+/// each cluster can have, which will show artifacts it that limit is reached.
 ///
 /// ## Light position buffer
 ///
@@ -277,19 +278,18 @@ impl Lights {
             .size((cluster_count * mem::size_of::<Aabb>()) as u64)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
-        let light_index_buffer = vk::BufferCreateInfo::builder()
+        let light_mask_buffer = vk::BufferCreateInfo::builder()
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .size((cluster_count * LIGHTS_PER_CLUSTER * mem::size_of::<u32>()) as u64)
+            .size((cluster_count * mem::size_of::<LightMask>()) as u64)
             .build();
-
         let buffers = {
             let memory_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
             let mut create_infos = vec![
                 light_buffer,
                 cluster_aabb_buffer,
             ];
-            for info in iter::repeat(light_index_buffer).take(FRAMES_IN_FLIGHT) {
+            for info in iter::repeat(light_mask_buffer).take(FRAMES_IN_FLIGHT) {
                 create_infos.push(info); 
             }
             for info in iter::repeat(light_position_buffer).take(FRAMES_IN_FLIGHT) {
@@ -437,7 +437,7 @@ impl Lights {
                     stage: vk::ShaderStageFlags::COMPUTE,
                     kind: BindingKind::Buffer([&buffers[1], &buffers[1]]),
                 },
-                // Light index buffer.
+                // Light mask buffer.
                 DescriptorBinding {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
@@ -510,7 +510,7 @@ impl Lights {
         &self.buffers[1]
     }
 
-    pub fn light_index_buffer(&self, frame: usize) -> &BufferView {
+    pub fn light_mask_buffer(&self, frame: usize) -> &BufferView {
         &self.buffers[2 + frame]
     }
 
@@ -560,5 +560,4 @@ impl ComputeProgram {
     }
 }
 
-const LIGHTS_PER_CLUSTER: usize = 64;
 const MAX_LIGHT_COUNT: usize = 256;

@@ -1,7 +1,5 @@
 
 const uint MAX_LIGHT_COUNT = 256;
-const uint MAX_LIGHTS_IN_CLUSTER = 64;
-const uint LIGHT_INDEX_SENTINEL = 0x7fffffffu;
 
 struct ClusterInfo {
 	uvec4 subdivisions;
@@ -34,3 +32,16 @@ struct DirLight {
 	vec4 dir;
 	vec4 irradiance;
 };
+
+const uint LIGHT_MASK_WORD_COUNT = MAX_LIGHT_COUNT / 32;
+
+struct LightMask {
+	uint mask[LIGHT_MASK_WORD_COUNT];
+};
+
+uint cluster_index(uvec3 subdivisions, uvec3 coords) {
+	return coords.z * subdivisions.x * subdivisions.y
+		+ coords.y * subdivisions.x
+		+ coords.x;
+}
+

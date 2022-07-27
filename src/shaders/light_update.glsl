@@ -10,7 +10,6 @@ layout (local_size_x = THREAD_COUNT, local_size_y = 1, local_size_z = 1) in;
 readonly layout (std140, set = 0, binding = 0) uniform View {
 	vec4 eye;
 	mat4 view;
-	mat4 inverse_view;
 	mat4 proj_view;
 };
 

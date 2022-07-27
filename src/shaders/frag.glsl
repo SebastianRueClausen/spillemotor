@@ -38,8 +38,8 @@ readonly layout (std430, set = 1, binding = 1) buffer Lights {
 	PointLight point_lights[];
 };
 
-readonly layout (std430, set = 1, binding = 2) buffer LightIndices {
-	uint light_indices[];
+readonly layout (std430, set = 1, binding = 2) buffer LightMasks {
+	LightMask light_masks[];
 };
 
 layout (location = 0) in vec2 in_texcoord;
@@ -144,12 +144,6 @@ uvec3 cluster_coords(vec2 coords, float view_z) {
 	return uvec3(ij, k);
 }
 
-uint cluster_index(uvec3 coords) {
-	return coords.z * cluster_info.subdivisions.x * cluster_info.subdivisions.y
-		+ coords.y * cluster_info.subdivisions.x
-		+ coords.x;
-}
-
 void main() {
 	vec4 color = texture(base_color_sampler, in_texcoord);
 	vec3 normal = texture(normal_sampler, in_texcoord).rgb * 2.0 - 1.0;
@@ -182,28 +176,31 @@ void main() {
 
 #ifdef CLUSTERED
 	uvec3 cluster_coords = cluster_coords(gl_FragCoord.xy, in_view_z);
-	uint cluster_index = cluster_index(cluster_coords);
-
-	uint light_base = cluster_index * MAX_LIGHTS_IN_CLUSTER;
+	uint cluster_index = cluster_index(cluster_info.subdivisions.xyz, cluster_coords);
 	uint light_count = 0;
 
-	for (light_count = 0; light_count < MAX_LIGHTS_IN_CLUSTER; light_count++) {
-		uint light_index = light_indices[light_base + light_count];
-		if (light_index == LIGHT_INDEX_SENTINEL) {
-			break;
+	LightMask light_mask = light_masks[cluster_index];
+	
+	for (uint i = 0; i < LIGHT_MASK_WORD_COUNT; ++i) {
+		uint word = light_mask.mask[i];
+
+		while (word != 0) {
+			uint bit_index = findLSB(word);
+			uint light_index = i * 32 + bit_index;
+
+			word &= ~uint(1 << bit_index);
+			light_count += 1;
+
+			PointLight light = point_lights[light_index];
+
+			vec3 light_dir = normalize(vec3(light.pos) - vec3(in_world_position));
+			float dist = length(vec3(light.pos) - vec3(in_world_position));
+			vec3 irradiance = vec3(light.lum) / (4.0 * PI * dist * dist);
+
+			radiance += brdf(albedo, normal, view_dir, light_dir, irradiance, roughness, metallic, f0);
 		}
-
-		PointLight light = point_lights[light_index];
-
-		vec3 light_dir = normalize(vec3(light.pos) - vec3(in_world_position));
-		float dist = length(vec3(light.pos) - vec3(in_world_position));
-		vec3 irradiance = vec3(light.lum) / (4.0 * PI * dist * dist);
-
-		radiance += brdf(albedo, normal, view_dir, light_dir, irradiance, roughness, metallic, f0);
 	}
-
 #else
-
 	for (uint light_index = 0; light_index < point_light_count; light_index++) {
 		PointLight light = point_lights[light_index];
 
@@ -213,11 +210,9 @@ void main() {
 
 		radiance += brdf(albedo, normal, view_dir, light_dir, irradiance, roughness, metallic, f0);
 	}
-
 #endif
 
 	vec3 ambient = vec3(0.040) * albedo;
-
 	radiance += ambient;
 	out_color = vec4(aces_approx(radiance), 1.0);
 

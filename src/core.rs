@@ -227,7 +227,7 @@ impl Renderer {
 
                     let buffer_barriers = [
                         buffer_barrier(
-                            self.scene.lights.light_index_buffer(frame.index),
+                            self.scene.lights.light_mask_buffer(frame.index),
                             vk::AccessFlags::SHADER_WRITE,
                             vk::AccessFlags::SHADER_READ,
                         ),

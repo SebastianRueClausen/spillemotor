@@ -12,6 +12,7 @@ float rand(vec2 co){
 vec4 debug_cluster_overlay(vec4 background, uvec3 cluster_coords, uint lights_in_cluster) {
     float cluster_overlay_alpha = 0.3;
 
+	/*
 	uint z_slice = cluster_coords.z;
     // A hack to make the colors alternate a bit more
     if ((z_slice & 1u) == 1u) {
@@ -31,6 +32,7 @@ vec4 debug_cluster_overlay(vec4 background, uvec3 cluster_coords, uint lights_in
         (1.0 - cluster_overlay_alpha) * background.rgb + cluster_overlay_alpha * cluster_color,
         background.a
     );
+	*/
 
     float max_light_complexity_per_cluster = 1.0;
     background.r = (1.0 - cluster_overlay_alpha) * background.r
