@@ -36,43 +36,31 @@ impl Default for DirLight {
     }
 }
 
-/// SPEED! SPEED! SPEED!
-///
-/// Split this into two parts:
-///
-/// - Cull: The radius and position in view space.
-/// - Draw: The lumen and position in world space.
-///
-/// Then we can run the update light compute shader which updates the view position on the cull
-/// struct. This shader has to access both the cull and draw parts, but only visits each light
-/// once, i.e. O(n).
-///
-/// When running the cluster update shader, we only have to access the cull data, and when drawing
-/// we only have to access the draw data.
-///
-/// We will have to have multiple copies of the cull data, but not draw data. This doesn't take up
-/// more vram than having the light position buffer we have now, since the cull data can fit into a
-/// single vec4.
-///
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PointLight {
-    pub world_position: Vec4,
-    pub lum: Vec4,
+    world_position: Vec4,
+    lum: Vec3,
     // Used to determine the which clusters are effected by the light.
     //
     // TODO: Could perhaps be calculated from `lum`?.
-    pub radius: f32,
+    radius: f32,
 }
 
 impl PointLight {
     pub fn new(pos: Vec3, lum: Vec3, radius: f32) -> Self {
         Self {
             world_position: Vec4::from((pos, 1.0)),
-            lum: Vec4::from((lum, 1.0)),
+            lum,
             radius,
         }
     }
+}
+
+#[repr(C)]
+struct LightPos {
+    view_pos: Vec3,
+    radius: f32,
 }
 
 /// The data of the light buffer.
@@ -239,8 +227,7 @@ struct LightMask {
 /// A list of the positions of all lights in view space. This is updated before doing light culling
 /// each frame. This is simply an optimization as we could just as easily transform the positions
 /// during light culling, but since light culling runs in `O(n * k)` time where n is the number
-/// of lights and `k` the number of clusters, this will hopefully speed things up by reducing the
-/// complexity to `O(n)` but adding an extra memory lookup during culling.
+/// of lights and `k` the number of clusters, this will hopefully speed things up.
 ///
 pub struct Lights {
     pub buffers: Buffers,
@@ -270,7 +257,7 @@ impl Lights {
             .build();
         let light_position_buffer = vk::BufferCreateInfo::builder()
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .size(mem::size_of::<[Vec4; MAX_LIGHT_COUNT]>() as u64)
+            .size(mem::size_of::<[LightPos; MAX_LIGHT_COUNT]>() as u64)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .build();
         let cluster_aabb_buffer = vk::BufferCreateInfo::builder()

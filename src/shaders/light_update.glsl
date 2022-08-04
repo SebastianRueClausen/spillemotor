@@ -21,12 +21,16 @@ readonly layout (std430, set = 0, binding = 1) buffer Lights {
 };
 
 writeonly layout (std430, set = 0, binding = 2) buffer LightPositions {
-	vec4 light_positions[];
+	LightPos light_positions[];
 };
 
 void main() {
 	uint light_index = gl_LocalInvocationIndex + THREAD_COUNT * gl_WorkGroupID.x;
 	if (light_index < point_light_count) {
-		light_positions[light_index] = view * point_lights[light_index].pos;
+		PointLight light = point_lights[light_index];
+		light_positions[light_index] = LightPos(
+			(view * light.pos).xyz,
+			light.radius
+		);
 	}
 }

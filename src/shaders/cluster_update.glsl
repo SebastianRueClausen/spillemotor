@@ -15,7 +15,7 @@ readonly layout (std430, set = 0, binding = 0) buffer Lights {
 };
 
 readonly layout (std430, set = 0, binding = 1) buffer LightPositions {
-	vec4 light_positions[];
+	LightPos light_positions[];
 };
 
 readonly layout (std430, set = 0, binding = 2) buffer Aabbs {
@@ -48,17 +48,14 @@ void main() {
 
 	uint start = gl_LocalInvocationID.x;
 
-	for (uint i = 0; i < point_light_count && start + i < point_light_count; i += THREADS_PER_CLUSTER) {
-		uint light_index = start + i;
+	for (uint i = start; i < point_light_count; i += THREADS_PER_CLUSTER) {
+		LightPos light = light_positions[i];
 
-		PointLight light = point_lights[light_index];
-		vec3 pos = vec3(light_positions[light_index]);
-
-		Sphere sphere = Sphere(pos, light.radius);
+		Sphere sphere = Sphere(light.view_pos, light.radius);
 
 		if (sphere_intersects_aabb(aabb, sphere)) {
-			uint word = light_index / 32;
-			uint bit = light_index % 32;
+			uint word = i / 32;
+			uint bit = i % 32;
 
 			atomicOr(shared_mask.mask[word], 1 << bit);
 		}
