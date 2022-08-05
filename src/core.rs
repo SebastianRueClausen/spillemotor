@@ -9,9 +9,11 @@ use std::path::Path;
 use std::{iter, mem, ops, hash};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::camera::{InputState, Camera};
-use crate::resource::{Buffers, BufferView, Image, Images, MappedMemory};
+use crate::resource::{self, Image, Buffer, MappedMemory, TextureSampler};
 use crate::scene::Scene;
 use crate::{gltf_import, font_import};
 use crate::text::TextPass;
@@ -22,7 +24,6 @@ pub struct Renderer {
     render_pass: RenderPass,
     frame_queue: FrameQueue,
     render_targets: RenderTargets,
-    descriptor_layout_cache: DescriptorLayoutCache,
     text_pass: TextPass,
     camera_uniforms: CameraUniforms,
     camera: Camera,
@@ -42,8 +43,6 @@ impl Renderer {
         let render_pass = RenderPass::new(&device, &swapchain, &render_targets)?;
         let frame_queue = FrameQueue::new(&device)?;
 
-        let mut descriptor_layout_cache = DescriptorLayoutCache::default();
-
         let camera = Camera::new(swapchain.aspect_ratio());
         let camera_uniforms = CameraUniforms::new(&device, &camera, &swapchain)?;
 
@@ -51,7 +50,6 @@ impl Renderer {
 
         let scene = Scene::from_scene_data(
             &device,
-            &mut descriptor_layout_cache,
             &swapchain,
             &render_pass,
             &render_targets,
@@ -64,7 +62,6 @@ impl Renderer {
 
         let text_pass = TextPass::new(
             &device,
-            &mut descriptor_layout_cache,
             &swapchain,
             &render_pass,
             &render_targets,
@@ -83,7 +80,6 @@ impl Renderer {
             render_pass,
             frame_queue,
             render_targets,
-            descriptor_layout_cache,
             camera,
             camera_uniforms,
             scene,
@@ -133,7 +129,7 @@ impl Renderer {
                     self.device.handle.begin_command_buffer(frame.command_buffer, &begin_info)?;
                   
                     let buffer_barrier = |
-                        buffer: &BufferView,
+                        buffer: &Buffer,
                         src_access: vk::AccessFlags,
                         dst_access: vk::AccessFlags,
                     | -> vk::BufferMemoryBarrier {
@@ -410,17 +406,12 @@ impl Renderer {
 
         self.device.wait_until_idle();
 
-        unsafe {
-            self.render_targets.destroy(&self.device);
-            self.render_pass.destroy(&self.device);
-        }
-
         let extent = vk::Extent2D {
             width: window.inner_size().width,
             height: window.inner_size().height,
         };
 
-        self.swapchain.recreate(&self.device, extent)?;
+        self.swapchain.recreate(extent)?;
         self.render_targets = RenderTargets::new(&self.device, &self.swapchain)?;
         self.render_pass = RenderPass::new(&self.device, &self.swapchain, &self.render_targets)?;
 
@@ -442,24 +433,12 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         self.device.wait_until_idle();
-
-        unsafe {
-            self.frame_queue.destroy(&self.device);
-            self.render_targets.destroy(&self.device);
-            self.render_pass.destroy(&self.device);
-            self.swapchain.destroy(&self.device);
-            self.descriptor_layout_cache.destroy(&self. device);
-            self.camera_uniforms.destroy(&self.device);
-            self.scene.destroy(&self.device);
-            self.text_pass.destroy(&self.device);
-            self.device.destroy();
-        }
     }
 }
 
 /// The device and data connected to the device used for rendering. This struct data is static
 /// after creation and doesn't depend on external factors such as display size.
-pub struct Device {
+pub struct DeviceShared {
     /// Name of `physical`, for instance "GTX 770".
     #[allow(dead_code)]
     name: String,
@@ -477,17 +456,42 @@ pub struct Device {
 
     surface: Surface,
     messenger: DebugMessenger,
+
     /// Queue used to submit render commands.
     graphics_queue: Queue,
+
     /// Queue used to submut transfer commands, may be the same as `graphics_queue`.
     transfer_queue: Queue,
+
     /// Graphics pool fore recording render commands.
     graphics_pool: vk::CommandPool,
+
     /// Command pool for recording transfer commands. Not used for any rendering.
     transfer_pool: vk::CommandPool,
+
+    descriptor_layouts: RefCell<HashMap<DescriptorLayoutBindings, vk::DescriptorSetLayout>>,
+}
+
+#[derive(Clone)]
+pub struct Device {
+    shared: Rc<DeviceShared>,
+}
+
+impl ops::Deref for Device {
+    type Target = DeviceShared;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
 }
 
 impl Device {
+    pub fn new(window: &winit::window::Window) -> Result<Self> {
+        Ok(Self { shared: Rc::new(DeviceShared::new(window)?) })
+    }
+}
+
+impl DeviceShared {
     pub fn new(window: &winit::window::Window) -> Result<Self> {
         let entry = unsafe { ash::Entry::load()? };
 
@@ -688,12 +692,15 @@ impl Device {
             handle.create_command_pool(&info, None)?
         };
 
+        let descriptor_layouts = RefCell::new(HashMap::default());
+
         Ok(Self {
             name,
             entry,
             instance,
             physical,
             handle,
+            descriptor_layouts,
             memory_properties,
             device_properties,
             surface,
@@ -766,19 +773,22 @@ impl Device {
             self.handle.device_wait_idle().expect("failed waiting for idle device");
         }
     }
+}
 
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    unsafe fn destroy(&self) {
-        self.handle.destroy_command_pool(self.graphics_pool, None);
-        self.handle.destroy_command_pool(self.transfer_pool, None);
-        self.messenger.destroy();
-        self.handle.destroy_device(None);
-        self.surface.destroy();
-        self.instance.destroy_instance(None);
+impl Drop for DeviceShared {
+    fn drop(&mut self) {
+        unsafe {
+            for (_, layout) in self.descriptor_layouts.borrow_mut().drain() {
+                self.handle.destroy_descriptor_set_layout(layout, None);
+            }
+
+            self.handle.destroy_command_pool(self.graphics_pool, None);
+            self.handle.destroy_command_pool(self.transfer_pool, None);
+            self.messenger.destroy();
+            self.handle.destroy_device(None);
+            self.surface.destroy();
+            self.instance.destroy_instance(None);
+        }
     }
 }
 
@@ -851,6 +861,8 @@ pub struct RenderPass {
     /// As you can see there is a framebuffer for each combination of frame and image.
     ///
     framebuffers: Vec<vk::Framebuffer>,
+
+    device: Device,
 }
 
 impl RenderPass {
@@ -950,10 +962,7 @@ impl RenderPass {
             })
             .collect();
 
-        Ok(RenderPass {
-            framebuffers: framebuffers?,
-            handle,
-        })
+        Ok(RenderPass { device: device.clone(), framebuffers: framebuffers?, handle })
     }
 
     /// Get the framebuffer mapped to `image_index` and `frame_index`.
@@ -968,16 +977,16 @@ impl RenderPass {
         let index = frame_index as u32 * swapchain.image_count() + image_index;
         self.framebuffers[index as usize]
     }
+}
 
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    unsafe fn destroy(&self, device: &Device) {
-        device.handle.destroy_render_pass(self.handle, None);
-        for buffer in &self.framebuffers {
-            device.handle.destroy_framebuffer(*buffer, None);
+impl Drop for RenderPass {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.handle.destroy_render_pass(self.handle, None);
+
+            for framebuffer in &self.framebuffers {
+                self.device.handle.destroy_framebuffer(*framebuffer, None);
+            }
         }
     }
 }
@@ -1040,6 +1049,8 @@ pub struct FrameQueue {
     /// The index of the frame currently being rendered or presented. It changes just before
     /// rendering of the next image begins.
     frame_index: usize,
+
+    device: Device,
 }
 
 impl FrameQueue {
@@ -1059,10 +1070,7 @@ impl FrameQueue {
             .map(|(i, buffer)| Frame::new(device, i, buffer))
             .collect();
 
-        Ok(Self {
-            frames: frames?,
-            frame_index: 0,
-        })
+        Ok(Self { frames: frames?, frame_index: 0, device: device.clone() })
     }
 
     pub fn next_frame(&mut self) {
@@ -1072,28 +1080,23 @@ impl FrameQueue {
     pub fn current_frame(&self) -> &Frame {
         &self.frames[self.frame_index]
     }
+}
 
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    unsafe fn destroy(&self, device: &Device) {
-        let command_buffers: Vec<_> = self
-            .frames
-            .iter()
-            .map(|frame| {
-                device.handle.destroy_semaphore(frame.rendered, None);
-                device.handle.destroy_semaphore(frame.presented, None);
-                device.handle.destroy_fence(frame.ready_to_draw, None);
+impl Drop for FrameQueue {
+    fn drop(&mut self) {
+        unsafe {
+            let command_buffers: Vec<_> = self.frames
+                .iter()
+                .map(|frame| {
+                    self.device.handle.destroy_semaphore(frame.rendered, None);
+                    self.device.handle.destroy_semaphore(frame.presented, None);
+                    self.device.handle.destroy_fence(frame.ready_to_draw, None);
 
-                frame.command_buffer
-            })
-            .collect();
-
-        device
-            .handle
-            .free_command_buffers(device.graphics_pool, &command_buffers);
+                    frame.command_buffer
+                })
+                .collect();
+            self.device.handle.free_command_buffers(self.device.graphics_pool, &command_buffers);
+        }
     }
 }
 
@@ -1230,7 +1233,7 @@ pub struct RenderTargets {
     /// | 1     | depth |
     /// | 1     | msaa  |
     ///
-    images: Images,
+    images: Vec<Image>,
     sample_count: vk::SampleCountFlags,
 }
 
@@ -1304,16 +1307,13 @@ impl RenderTargets {
             .map(|info| *info)
             .take(FRAMES_IN_FLIGHT * 2)
             .collect();
-        let images = Images::new(
+        let (images, _) = resource::create_images(
             device,
             &image_infos,
             &view_infos,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
-        Ok(Self {
-            images,
-            sample_count,
-        })
+        Ok(Self { images, sample_count })
     }
 
     /// Iterator over each render target.
@@ -1324,15 +1324,6 @@ impl RenderTargets {
                 depth: &images[0],
                 msaa: &images[1],
             })
-    }
-
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    unsafe fn destroy(&self, device: &Device) {
-        self.images.destroy(device);
     }
 }
 
@@ -1345,6 +1336,8 @@ pub struct Swapchain {
     pub extent: vk::Extent2D,
 
     images: Vec<SwapchainImage>,
+
+    device: Device,
 }
 
 impl Swapchain {
@@ -1428,6 +1421,7 @@ impl Swapchain {
             .collect();
 
         Ok(Self {
+            device: device.clone(),
             surface_format,
             images: images?,
             present_mode,
@@ -1442,24 +1436,24 @@ impl Swapchain {
     /// `extent` must be valid here unlike in `Self::new`, otherwise it could end in and endless
     /// cycle if recreating the swapchain, if for some reason the surface continues to give us and
     /// invalid extent.
-    pub fn recreate(&mut self, device: &Device, extent: vk::Extent2D) -> Result<()> {
+    pub fn recreate(&mut self, extent: vk::Extent2D) -> Result<()> {
         if extent.width == u32::MAX {
             return Err(anyhow!("`extent` must be valid when recreating swapchain"));
         }
 
         let surface_caps = unsafe {
-            device
-                .surface
-                .loader
-                .get_physical_device_surface_capabilities(device.physical, device.surface.handle)?
+            self.device.surface.loader.get_physical_device_surface_capabilities(
+                self.device.physical,
+                self.device.surface.handle,
+            )?
         };
 
-        let queue_families = [device.graphics_queue.family_index];
+        let queue_families = [self.device.graphics_queue.family_index];
         let min_image_count = (FRAMES_IN_FLIGHT as u32).max(surface_caps.min_image_count);
 
         let swapchain_info = vk::SwapchainCreateInfoKHR::builder()
             .old_swapchain(self.handle)
-            .surface(device.surface.handle)
+            .surface(self.device.surface.handle)
             .min_image_count(min_image_count)
             .image_format(self.surface_format.format)
             .image_color_space(self.surface_format.color_space)
@@ -1477,7 +1471,7 @@ impl Swapchain {
         unsafe {
             self.loader.destroy_swapchain(self.handle, None);
             for image in &self.images {
-                device.handle.destroy_image_view(image.view, None);
+                self.device.handle.destroy_image_view(image.view, None);
             }
         }
 
@@ -1487,7 +1481,7 @@ impl Swapchain {
         let images = unsafe { self.loader.get_swapchain_images(self.handle)? };
         let images: Result<Vec<_>> = images
             .into_iter()
-            .map(|image| SwapchainImage::new(device, image, self.surface_format.format))
+            .map(|image| SwapchainImage::new(&self.device, image, self.surface_format.format))
             .collect();
 
         self.images = images?;
@@ -1520,17 +1514,16 @@ impl Swapchain {
     pub fn aspect_ratio(&self) -> f32 {
         self.extent.width as f32 / self.extent.height as f32
     }
+}
 
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    unsafe fn destroy(&self, device: &Device) {
-        self.loader.destroy_swapchain(self.handle, None);
-
-        for image in &self.images {
-            device.handle.destroy_image_view(image.view, None);
+impl Drop for Swapchain {
+    fn drop(&mut self) {
+        unsafe {
+            self.loader.destroy_swapchain(self.handle, None);
+            
+            for image in &self.images {
+                self.device.handle.destroy_image_view(image.view, None);
+            }
         }
     }
 }
@@ -1607,7 +1600,7 @@ impl ProjUniform {
 /// | 1     | view    |
 ///
 pub struct CameraUniforms {
-    buffers: Buffers,
+    buffers: Vec<Buffer>,
     mapped: MappedMemory,
 }
 
@@ -1632,8 +1625,8 @@ impl CameraUniforms {
         let memory_flags = vk::MemoryPropertyFlags::HOST_VISIBLE
             | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-        let buffers = Buffers::new(device, &infos, memory_flags, alignment)?;
-        let mapped = buffers.block.map(device)?;
+        let (buffers, block) = resource::create_buffers(device, &infos, memory_flags, alignment)?;
+        let mapped = MappedMemory::new(&block)?;
 
         let uniforms = Self { buffers, mapped };
 
@@ -1645,43 +1638,32 @@ impl CameraUniforms {
     /// Update view uniform for frame with index `frame_index`.
     pub fn update_view(&self, frame_index: usize, camera: &Camera) {
         let view = ViewUniform::new(camera);
-        let range = self.buffers[1 + frame_index].range.clone();
-
-        unsafe {
-            self.mapped.get_range(range).copy_from_slice(bytemuck::bytes_of(&view));
-        }
+        self.mapped
+            .get_buffer_data(self.view_uniform(frame_index))
+            .copy_from_slice(bytemuck::bytes_of(&view));
     }
 
     pub fn update_proj(&self, camera: &Camera, swapchain: &Swapchain) {
         let proj = ProjUniform::new(camera, swapchain);
-        let range = self.buffers[0].range.clone();
-
-        unsafe {
-            self.mapped.get_range(range).copy_from_slice(bytemuck::bytes_of(&proj));
-        }
+        self.mapped
+            .get_buffer_data(self.proj_uniform())
+            .copy_from_slice(bytemuck::bytes_of(&proj));
     }
 
-    pub fn view_uniform(&self, frame: usize) -> &BufferView {
-        &self.buffers[1 + frame]
-    }
-
-    pub fn proj_uniform(&self) -> &BufferView {
+    pub fn proj_uniform(&self) -> &Buffer {
         &self.buffers[0]
     }
 
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        self.buffers.destroy(device);
+    pub fn view_uniform(&self, frame: usize) -> &Buffer {
+        &self.buffers[1 + frame]
     }
 }
 
 pub struct ShaderModule {
     handle: vk::ShaderModule,
     entry: CString,
+
+    device: Device,
 }
 
 impl ShaderModule {
@@ -1706,7 +1688,7 @@ impl ShaderModule {
             return Err(anyhow!("invalid entry name `entry`"));
         };
 
-        Ok(ShaderModule { handle, entry })
+        Ok(ShaderModule { device: device.clone(), handle, entry })
     }
 
     fn stage_create_info(
@@ -1718,9 +1700,13 @@ impl ShaderModule {
             .module(self.handle)
             .name(&self.entry)
     }
+}
 
-    pub unsafe fn destroy(&self, device: &Device) {
-        device.handle.destroy_shader_module(self.handle, None);
+impl Drop for ShaderModule {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.handle.destroy_shader_module(self.handle, None);
+        }
     }
 }
 
@@ -1767,29 +1753,9 @@ impl PartialEq for DescriptorLayoutBindings {
 
 impl Eq for DescriptorLayoutBindings {}
 
-#[derive(Default)]
-pub struct DescriptorLayoutCache {
-    lookup: HashMap<DescriptorLayoutBindings, vk::DescriptorSetLayout>,
-}
-
-impl DescriptorLayoutCache {
-    /// Destroy every layout in the cache. This will leave any descriptor sets using any layouts in
-    /// this cache invalid.
-    ///
-    /// # Safety
-    ///
-    /// Don't use any descriptor sets created using this cache after calling this function.
-    unsafe fn destroy(&mut self, device: &Device) {
-        for (_, layout) in self.lookup.drain() {
-            device.handle.destroy_descriptor_set_layout(layout, None);
-
-        }
-    }
-}
-
 pub enum BindingKind<'a, const N: usize> {
-    Buffer([&'a BufferView; N]),
-    Image(vk::Sampler, [&'a Image; N]),
+    Buffer([&'a Buffer; N]),
+    Image(&'a TextureSampler, [&'a Image; N]),
 }
 
 pub struct DescriptorBinding<'a, const N: usize> {
@@ -1807,6 +1773,8 @@ pub struct DescriptorSet {
 
     pub pool: vk::DescriptorPool,
     pub sets: Vec<vk::DescriptorSet>,
+
+    device: Device,
 }
 
 impl ops::Index<usize> for DescriptorSet {
@@ -1818,11 +1786,7 @@ impl ops::Index<usize> for DescriptorSet {
 }
 
 impl DescriptorSet {
-    pub fn new<const N: usize>(
-        device: &Device,
-        cache: &mut DescriptorLayoutCache,
-        bindings: &[DescriptorBinding<N>],
-    ) -> Result<Self> {
+    pub fn new<const N: usize>(device: &Device, bindings: &[DescriptorBinding<N>]) -> Result<Self> {
         let layout = unsafe {
             let layout_bindings: SmallVec<[_; 6]> = bindings
                 .iter()
@@ -1838,17 +1802,17 @@ impl DescriptorSet {
                 .collect();
 
             let layout_bindings = DescriptorLayoutBindings::from(layout_bindings);
+            let mut descriptor_layouts = device.descriptor_layouts.borrow_mut();
 
-            if let Some(layout) = cache.lookup.get(&layout_bindings) {
+            if let Some(layout) = descriptor_layouts.get(&layout_bindings) {
                 layout.clone()
             } else {
                 let layout_info = vk::DescriptorSetLayoutCreateInfo::builder()
                     .bindings(&layout_bindings.bindings)
                     .build();
-                let layout = device
-                    .handle
+                let layout = device.handle
                     .create_descriptor_set_layout(&layout_info, None)?;
-                cache.lookup.insert(layout_bindings, layout);
+                descriptor_layouts.insert(layout_bindings, layout);
                 layout
             }
         };
@@ -1910,7 +1874,7 @@ impl DescriptorSet {
                             image: [vk::DescriptorImageInfo {
                                 image_layout: images[n].layout,
                                 image_view: images[n].view,
-                                sampler: *sampler,
+                                sampler: sampler.handle,
                             }],
                         },
                     }
@@ -1934,16 +1898,15 @@ impl DescriptorSet {
             unsafe { device.handle.update_descriptor_sets(&writes, &[]) }
         }
 
-        Ok(Self { layout, pool, sets })
+        Ok(Self { device: device.clone(), layout, pool, sets })
     }
+}
 
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        device.handle.destroy_descriptor_pool(self.pool, None);
+impl Drop for DescriptorSet {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.handle.destroy_descriptor_pool(self.pool, None);
+        }
     }
 }
 
@@ -1970,6 +1933,8 @@ pub enum PipelineRequest<'a> {
 pub struct Pipeline {
     pub handle: vk::Pipeline,
     pub layout: vk::PipelineLayout,
+
+    device: Device,
 }
 
 impl Pipeline {
@@ -2067,7 +2032,7 @@ impl Pipeline {
                         .unwrap()
                 };
 
-                Ok(Self { handle, layout })
+                Ok(Self { device: device.clone(), handle, layout })
                 
             }
             PipelineRequest::Compute { descriptors, push_constants, shader } => {
@@ -2094,19 +2059,18 @@ impl Pipeline {
                         .unwrap()
                         .clone()
                 };
-                Ok(Self { handle, layout })
+                Ok(Self { device: device.clone(), handle, layout })
             }
         }
     }
-    
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        device.handle.destroy_pipeline(self.handle, None);
-        device.handle.destroy_pipeline_layout(self.layout, None);
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.handle.destroy_pipeline(self.handle, None);
+            self.device.handle.destroy_pipeline_layout(self.layout, None);
+        }
     }
 }
 

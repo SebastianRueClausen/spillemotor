@@ -5,7 +5,7 @@ use anyhow::Result;
 use std::{iter, mem};
 
 use crate::camera::Camera;
-use crate::resource::{MappedMemory, Buffers, Buffer, BufferView};
+use crate::resource::{self, MappedMemory, Buffer};
 use crate::core::{
     Device,
     Swapchain,
@@ -17,11 +17,10 @@ use crate::core::{
     DescriptorSet,
     DescriptorBinding,
     BindingKind,
-    DescriptorLayoutCache,
 };
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, bytemuck::NoUninit)]
 pub struct DirLight {
     pub direction: Vec4,
     pub irradiance: Vec4,
@@ -37,7 +36,7 @@ impl Default for DirLight {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy, bytemuck::NoUninit)]
 pub struct PointLight {
     world_position: Vec4,
     lum: Vec3,
@@ -65,12 +64,27 @@ struct LightPos {
 
 /// The data of the light buffer.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct LightBufferData {
     point_light_count: u32, 
 
     dir_light: DirLight,
     point_lights: [PointLight; MAX_LIGHT_COUNT],
+}
+
+unsafe impl bytemuck::NoUninit for LightBufferData {}
+
+impl LightBufferData {
+    fn new(lights: &[PointLight]) -> Self {
+        let mut point_lights = [PointLight::default(); MAX_LIGHT_COUNT];
+        let point_light_count = lights.len() as u32;
+
+        for (src, dst) in lights.iter().zip(point_lights.iter_mut()) {
+            *dst = *src;
+        }
+
+        Self { point_lights, point_light_count, dir_light: DirLight::default() }
+    }
 }
 
 #[repr(C)]
@@ -142,24 +156,19 @@ impl ClusterInfoBuffer {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
         let buffer = Buffer::new(device, &info, memory_flags)?;
-        let mapped = buffer.block.map(device)?;
+        let mapped = MappedMemory::new(&buffer.block)?;
         let info = ClusterInfo::new(swapchain, camera);
 
-        unsafe { mapped.get_range(..).copy_from_slice(bytemuck::bytes_of(&info)); }
+        mapped.get_buffer_data(&buffer).copy_from_slice(bytemuck::bytes_of(&info));
 
         Ok(Self { buffer, mapped, info })
     }
 
     fn handle_resize(&mut self, camera: &Camera, swapchain: &Swapchain) {
         self.info = ClusterInfo::new(swapchain, camera);
-         
-        unsafe {
-            self.mapped.get_range(..).copy_from_slice(bytemuck::bytes_of(&self.info));
-        }
-    }
-
-    pub unsafe fn destroy(&self, device: &Device) {
-        self.buffer.destroy(device);
+        self.mapped
+            .get_buffer_data(&self.buffer)
+            .copy_from_slice(bytemuck::bytes_of(&self.info));
     }
 }
 
@@ -230,7 +239,7 @@ struct LightMask {
 /// of lights and `k` the number of clusters, this will hopefully speed things up.
 ///
 pub struct Lights {
-    pub buffers: Buffers,
+    pub buffers: Vec<Buffer>,
     pub light_count: u32,
     pub cluster_info: ClusterInfoBuffer,
     pub cluster_build: ComputeProgram,
@@ -241,7 +250,6 @@ pub struct Lights {
 impl Lights {
     pub fn new(
         device: &Device,
-        layout_cache: &mut DescriptorLayoutCache,
         camera_uniforms: &CameraUniforms,
         camera: &Camera,
         swapchain: &Swapchain,
@@ -276,13 +284,18 @@ impl Lights {
                 light_buffer,
                 cluster_aabb_buffer,
             ];
+
             for info in iter::repeat(light_mask_buffer).take(FRAMES_IN_FLIGHT) {
                 create_infos.push(info); 
             }
+
             for info in iter::repeat(light_position_buffer).take(FRAMES_IN_FLIGHT) {
                 create_infos.push(info); 
             }
-            Buffers::new(device, &create_infos, memory_flags, 4)?
+
+            let (buffers, _) = resource::create_buffers(device, &create_infos, memory_flags, 4)?;
+
+            buffers
         };
 
         let light_staging = {
@@ -295,19 +308,11 @@ impl Lights {
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
             let buffer = Buffer::new(device, &info, memory_flags)?;
+            let light_data = LightBufferData::new(lights); 
 
-            buffer.block.map_with(device, |mapped| unsafe {
-                let ptr: *mut LightBufferData = mapped
-                    .as_ptr()
-                    .expect("light staging buffer doesn't have correct aligment");
-
-                (*ptr).point_light_count = lights.len() as u32;
-                (*ptr).dir_light = DirLight::default();
-
-                for (dst, src) in (*ptr).point_lights.iter_mut().zip(lights.iter()) {
-                    *dst = src.clone();
-                }
-            })?;
+            MappedMemory::new(&buffer.block)?
+                .get_buffer_data(&buffer)
+                .copy_from_slice(bytemuck::bytes_of(&light_data));
 
             buffer
         };
@@ -328,10 +333,8 @@ impl Lights {
             );
         })?;
 
-        unsafe { light_staging.destroy(device); }
-
         let cluster_build = {
-            let descriptor = DescriptorSet::new(device, layout_cache, &[
+            let descriptor = DescriptorSet::new(device, &[
                 DescriptorBinding {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
@@ -361,13 +364,11 @@ impl Lights {
                 shader: &shader,
             })?;
 
-            unsafe { shader.destroy(device); }
-
             ComputeProgram { pipeline, descriptor }
         };
 
         let light_update = {
-            let descriptor = DescriptorSet::new(device, layout_cache, &[
+            let descriptor = DescriptorSet::new(device, &[
                 DescriptorBinding {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
@@ -399,13 +400,11 @@ impl Lights {
                 shader: &shader,
             })?;
 
-            unsafe { shader.destroy(device); }
-
             ComputeProgram { pipeline, descriptor }
         };
 
         let cluster_update = {
-            let descriptor = DescriptorSet::new(device, layout_cache, &[
+            let descriptor = DescriptorSet::new(device, &[
                 // Light buffer.
                 DescriptorBinding {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -440,8 +439,6 @@ impl Lights {
                 push_constants: &[],
                 shader: &shader,
             })?;
-
-            unsafe { shader.destroy(device); }
 
             ComputeProgram { pipeline, descriptor }
         };
@@ -488,20 +485,20 @@ impl Lights {
         })
     }
 
-    pub fn light_buffer(&self) -> &BufferView {
+    pub fn light_buffer(&self) -> &Buffer {
         &self.buffers[0]
     }
 
     #[allow(unused)]
-    pub fn cluster_aabb_buffer(&self) -> &BufferView {
+    pub fn cluster_aabb_buffer(&self) -> &Buffer {
         &self.buffers[1]
     }
 
-    pub fn light_mask_buffer(&self, frame: usize) -> &BufferView {
+    pub fn light_mask_buffer(&self, frame: usize) -> &Buffer {
         &self.buffers[2 + frame]
     }
 
-    pub fn light_position_buffer(&self, frame: usize) -> &BufferView {
+    pub fn light_position_buffer(&self, frame: usize) -> &Buffer {
         &self.buffers[4 + frame]
     }
 
@@ -515,36 +512,11 @@ impl Lights {
         self.cluster_info.handle_resize(camera, swapchain);
         self.build_clusters(device)
     }
-
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        self.buffers.destroy(device);
-        self.cluster_info.destroy(device);
-        self.cluster_build.destroy(device);
-        self.light_update.destroy(device);
-        self.cluster_update.destroy(device);
-    }
 }
 
 pub struct ComputeProgram {
     pub descriptor: DescriptorSet,
     pub pipeline: Pipeline,
-}
-
-impl ComputeProgram {
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        self.descriptor.destroy(device);
-        self.pipeline.destroy(device);
-    }
 }
 
 const MAX_LIGHT_COUNT: usize = 256;

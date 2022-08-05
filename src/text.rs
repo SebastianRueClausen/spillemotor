@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use crate::core::{
     BindingKind,
     DescriptorBinding,
-    DescriptorLayoutCache,
     DescriptorSet,
     Device,
     FRAMES_IN_FLIGHT,
@@ -22,7 +21,7 @@ use crate::core::{
     Frame,
     Swapchain,
 };
-use crate::resource::{self, Buffers, Buffer, BufferView, Images};
+use crate::resource::{self, Buffer, Image, MappedMemory, TextureSampler};
 use crate::font_import::{FontData, Glyph};
 
 #[repr(C)]
@@ -48,13 +47,17 @@ pub struct TextPass {
     /// | 0     | index  |
     /// | 1     | index  |
     ///
-    buffers: Buffers,
+    buffers: Vec<Buffer>,
+
+    mapped: MappedMemory,
 
     /// Sampler to sample the glyph atlas.
-    sampler: vk::Sampler,
+    #[allow(dead_code)]
+    sampler: TextureSampler,
 
     /// Just a single image used to store the glyph atlas.
-    images: Images,
+    #[allow(dead_code)]
+    glyph_atlas: Image,
 
     /// The projection matrix used for rendering text.
     ///
@@ -67,7 +70,6 @@ pub struct TextPass {
 impl TextPass {
     pub fn new(
         device: &Device,
-        layout_cache: &mut DescriptorLayoutCache,
         swapchain: &Swapchain,
         render_pass: &RenderPass,
         render_targets: &RenderTargets,
@@ -75,7 +77,7 @@ impl TextPass {
     ) -> Result<Self> {
         let text_objects = TextObjects::new(FontAtlas::new(font));
 
-        let buffers = {
+        let (buffers, block) = {
             let vertex_info = vk::BufferCreateInfo::builder()
                 .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
                 .size(mem::size_of::<[Vertex; MAX_VERTEX_COUNT]>() as u64)
@@ -92,8 +94,10 @@ impl TextPass {
                 .collect();
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            Buffers::new(device, &infos, memory_flags, 4)?
+            resource::create_buffers(device, &infos, memory_flags, 4)?
         };
+
+        let mapped = MappedMemory::new(&block)?;
 
         let staging = {
             let create_info = vk::BufferCreateInfo::builder()
@@ -103,13 +107,14 @@ impl TextPass {
                 .build();
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            Buffer::new(device, &create_info, memory_flags)?
-        };
 
-        staging.block.map_with(device, |mapped| unsafe {
-            let len = font.atlas.len() as u64;
-            mapped.get_range(..len).copy_from_slice(font.atlas.as_slice());
-        })?;
+            let staging = Buffer::new(device, &create_info, memory_flags)?;
+            let mapped = MappedMemory::new(&staging.block)?;
+
+            mapped.get_buffer_data(&staging).copy_from_slice(font.atlas.as_slice());
+
+            staging
+        };
 
         let extent = vk::Extent3D {
             width: font.atlas_dim.x,
@@ -117,10 +122,10 @@ impl TextPass {
             depth: 1,
         };
 
-        let sampler = resource::create_texture_sampler(device)?;
+        let sampler = TextureSampler::new(device)?;
     
-        let mut images = {
-            let image_infos = [vk::ImageCreateInfo::builder()
+        let mut glyph_atlas = {
+            let image_info = vk::ImageCreateInfo::builder()
                 .image_type(vk::ImageType::TYPE_2D)
                 .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
                 .format(vk::Format::R8_UNORM)
@@ -130,26 +135,21 @@ impl TextPass {
                 .extent(extent)
                 .mip_levels(1)
                 .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .build()];
+                .samples(vk::SampleCountFlags::TYPE_1);
             let subresource_range = vk::ImageSubresourceRange::builder()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .base_mip_level(0)
                 .level_count(1)
                 .base_array_layer(0)
-                .layer_count(1)
-                .build();
-            let view_infos = [vk::ImageViewCreateInfo::builder()
+                .layer_count(1);
+            let view_info = vk::ImageViewCreateInfo::builder()
                 .view_type(vk::ImageViewType::TYPE_2D)
-                .subresource_range(subresource_range)
-                .format(vk::Format::R8_UNORM)
-                .build()];
-            Images::new(device, &image_infos, &view_infos, vk::MemoryPropertyFlags::DEVICE_LOCAL)?
+                .subresource_range(*subresource_range)
+                .format(vk::Format::R8_UNORM);
+            Image::new(device, *image_info, *view_info, vk::MemoryPropertyFlags::DEVICE_LOCAL)?
         };
 
-        for image in images.iter_mut() {
-            image.transition_layout(device, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
-        }
+        glyph_atlas.transition_layout(device, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
 
         device.transfer_with(|command_buffer| {
             let subresource = vk::ImageSubresourceLayers::builder()
@@ -169,24 +169,20 @@ impl TextPass {
                 device.handle.cmd_copy_buffer_to_image(
                     command_buffer,
                     staging.handle,
-                    images[0].handle,
+                    glyph_atlas.handle,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &regions,
                 );
             }
         })?;
 
-        unsafe { staging.destroy(device); }
+        glyph_atlas.transition_layout(device, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
 
-        for image in images.iter_mut() {
-            image.transition_layout(device, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
-        }
-
-        let descriptor = DescriptorSet::new(device, layout_cache, &[
+        let descriptor = DescriptorSet::new(device, &[
             DescriptorBinding {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
-                kind: BindingKind::Image(sampler, [&images[0]]),
+                kind: BindingKind::Image(&sampler, [&glyph_atlas]),
             },
         ])?;
 
@@ -237,23 +233,19 @@ impl TextPass {
             render_targets,
         })?;
 
-        unsafe {
-            vertex_module.destroy(device);
-            fragment_module.destroy(device);
-        }
-
         let width = swapchain.extent.width as f32;
         let height = swapchain.extent.height as f32;
         let proj = Mat4::orthographic_lh(0.0, width, 0.0, height, 0.0, 1.0);
 
         Ok(Self {
+            mapped,
             text_objects,
             proj,
             sampler,
             pipeline, 
             descriptor,
             buffers,
-            images,
+            glyph_atlas,
         })
     }
 
@@ -280,16 +272,16 @@ impl TextPass {
         let index_data = bytemuck::cast_slice(self.text_objects.indices.as_slice());
         let vertex_data = bytemuck::cast_slice(self.text_objects.vertices.as_slice());
 
-        self.buffers.block.map_with(device, |mapped| unsafe {
-            let index_start = self.index_buffer(frame.index).range.start;
-            let vertex_start = self.vertex_buffer(frame.index).range.start;
+        let index_buffer = self.mapped.get_buffer_data(self.index_buffer(frame.index));
+        let vertex_buffer = self.mapped.get_buffer_data(self.vertex_buffer(frame.index));
 
-            let index_end = index_start + index_data.len() as u64;
-            let vertex_end = vertex_start + vertex_data.len() as u64;
+        for (src, dst) in index_data.iter().zip(index_buffer.iter_mut()) {
+            *dst = *src; 
+        }
 
-            mapped.get_range(index_start..index_end).copy_from_slice(index_data);
-            mapped.get_range(vertex_start..vertex_end).copy_from_slice(vertex_data);
-        })?;
+        for (src, dst) in vertex_data.iter().zip(vertex_buffer.iter_mut()) {
+            *dst = *src; 
+        }
 
         unsafe {
             device.handle.cmd_bind_pipeline(
@@ -355,25 +347,12 @@ impl TextPass {
         Ok(ret) 
     }
 
-    fn vertex_buffer(&self, frame_index: usize) -> &BufferView {
+    fn vertex_buffer(&self, frame_index: usize) -> &Buffer {
         &self.buffers[frame_index]
     }
 
-    fn index_buffer(&self, frame_index: usize) -> &BufferView {
+    fn index_buffer(&self, frame_index: usize) -> &Buffer {
         &self.buffers[FRAMES_IN_FLIGHT + frame_index]
-    }
-
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        device.handle.destroy_sampler(self.sampler, None);
-        self.descriptor.destroy(device);
-        self.pipeline.destroy(device);
-        self.buffers.destroy(device);
-        self.images.destroy(device);
     }
 }
 

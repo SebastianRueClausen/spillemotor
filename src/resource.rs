@@ -1,7 +1,9 @@
 use anyhow::Result;
+use smallvec::SmallVec;
 use ash::vk;
 
-use std::{mem, ops};
+use std::{ops, slice};
+use std::rc::Rc;
 
 use crate::core::Device;
 use crate::util;
@@ -9,92 +11,57 @@ use crate::util;
 type MemoryRange = ops::Range<vk::DeviceSize>;
 
 /// A wrapper around a raw ptr into a mapped memory block.
-///
-/// # Safety
-///
-/// Don't use this after or freeing the [`MemoryBlock`] this is mapped into.
 pub struct MappedMemory {
     ptr: *mut u8,
-    size: vk::DeviceSize,
+    block: MemoryBlock,
 }
 
 impl MappedMemory {
-    /// Get the memory as slice of an abitrary type.
-    ///
-    /// The length of the slice is determined by the amount of objects of `T` which can fit into
-    /// the mapped memory.
-    ///
-    /// If the alignment of `T` isn't the same as the aligment of the mapped memory, it will return
-    /// `None`.
-    pub unsafe fn as_slice<T: Sized>(&self) -> Option<&mut [T]> {
-        let Some(ptr) = self.as_ptr() else {
-            return None;
+    pub fn new(block: &MemoryBlock) -> Result<Self> {
+        let ptr = unsafe {
+            block.device.handle
+                .map_memory(block.handle, 0, block.size, vk::MemoryMapFlags::empty())
+                .map(|ptr| ptr as *mut u8)?
         };
-
-        if mem::size_of::<T>() == 0 {
-            panic!("`T` has size of 0");
-        }
-
-        Some(std::slice::from_raw_parts_mut(
-            ptr,
-            self.size as usize / std::mem::size_of::<T>(),
-        ))
+        Ok(Self { ptr, block: block.clone() })
     }
 
-    /// Get the mapped pointer as an abitrary type.
-    ///
-    /// Returns `None` if the mapped pointer ins't aligned to the alignment of `T`.
-    pub unsafe fn as_ptr<T: Sized>(&self) -> Option<*mut T> {
-        if self.ptr.align_offset(mem::align_of::<T>()) != 0 {
-            return None;
-        }
-        Some(self.ptr as *mut T)
+    unsafe fn get_range_unchecked(&self, range: MemoryRange) -> &mut [u8] {
+        let start = self.ptr.offset(range.start as isize);
+        let len = range.end - range.start;
+        slice::from_raw_parts_mut(start, len as usize)
     }
 
-    /// Get slice of memory in a `range` relative from the start of the buffer.
+    /// Get the mapped data of a buffer.
     ///
-    /// # Panics
+    /// # Panic
     ///
-    /// If the range isn't contained in the mapped memory.
-    #[inline]
-    pub unsafe fn get_range(&self, range: impl ops::RangeBounds<vk::DeviceSize>) -> &mut [u8] {
-        let start = match range.start_bound() {
-            ops::Bound::Included(&start) => start,
-            ops::Bound::Excluded(start) => start - 1,
-            ops::Bound::Unbounded => 0,
-        };
-
-        let end = match range.end_bound() {
-            ops::Bound::Included(&end) => end - 1,
-            ops::Bound::Excluded(end) => *end,
-            ops::Bound::Unbounded => self.size,
-        };
-
-        let start = start as usize;
-        let end = end as usize;
-
-        // `as_slice` will only fail if the type isn't aligned with `ptr`, this will never fail for
-        // `u8`.
-        self.as_slice::<u8>()
-            .unwrap()
-            .get_mut(start..end)
-            .expect("`range` is outside memory")
+    /// This will panic if the underlying memory block of the buffer isn't the same as the
+    /// underlying block of `self`.
+    pub fn get_buffer_data(&self, buffer: &Buffer) -> &mut [u8] {
+        if buffer.block != self.block {
+            panic!("block of buffer isn't same as mapped memory");
+        }
+        // Safety: At this point we know that the buffer uses the same memory block, and the buffer
+        // will always be in the range of the memory block.
+        unsafe { self.get_range_unchecked(buffer.range.clone()) }
     }
 }
 
-/// A untyped block of raw device memory.
-pub struct MemoryBlock {
+/// A block of raw device memory.
+pub struct MemoryBlockShared {
     handle: vk::DeviceMemory,
 
     #[allow(dead_code)]
     properties: vk::MemoryPropertyFlags,
 
     size: vk::DeviceSize,
+
+    device: Device,
 }
 
-impl MemoryBlock {
-    /// Allocate a new block of device memory.
-    pub fn allocate(
+impl MemoryBlockShared {
+    fn new(
         device: &Device,
         properties: vk::MemoryPropertyFlags,
         info: &vk::MemoryAllocateInfo,
@@ -103,85 +70,64 @@ impl MemoryBlock {
         let size = info.allocation_size;
 
         Ok(Self {
+            device: device.clone(),
             handle,
             properties,
             size,
         })
     }
 
-    /// Bind [`BufferView`] to a slice of the memory owned by `self. The memory range is determined
-    /// by `buffer` and the function will fail if that range goes past the end of the memory block.
-    pub fn bind_buffer_view(&self, device: &Device, buffer: &BufferView) -> Result<()> {
-        unsafe {
-            device
-                .handle
-                .bind_buffer_memory(buffer.handle, self.handle, buffer.range.start)?;
-        }
-        Ok(())
-    }
-
-    /// Map the whole memory block.
-    /// May fail if the memory isn't host visble.
-    pub fn map(&self, device: &Device) -> Result<MappedMemory> {
-        let ptr = unsafe {
-            let flags = vk::MemoryMapFlags::empty();
-            device
-                .handle
-                .map_memory(self.handle, 0, self.size, flags)
-                .map(|ptr| ptr as *mut u8)?
-        };
-        Ok(MappedMemory {
-            ptr: ptr as *mut u8,
-            size: self.size,
-        })
-    }
-
-    /// Map the block and let `func` use the mapped memory. After the `func` is called, the memory
-    /// is unmaped.
-    pub fn map_with<F, R>(&self, device: &Device, func: F) -> Result<R>
-    where
-        F: FnOnce(&MappedMemory) -> R,
-    {
-        self.map(device).map(|mapped| {
-            let ret = func(&mapped);
-            self.unmap(device, mapped);
-            ret
-        })
-    }
-
-    /// Unmap the the memory of self. It must consume a [`MappedMemory`] object to both insure that
-    /// the memory is current mapped, and to insure said mapped memory isn't used after calling
-    /// this.
-    pub fn unmap(&self, device: &Device, _mapped: MappedMemory) {
-        unsafe {
-            device.handle.unmap_memory(self.handle);
-        }
-    }
-
-    /// Free the memory and leave `self` in an invalid state. This leaves any [`MappedMemory`]
-    /// pointing into this block dangling.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` and any [`MappedMemory`] pointing intp this block after calling this
-    /// function.
-    pub unsafe fn free(&self, device: &Device) {
-        device.handle.free_memory(self.handle, None);
+    #[allow(dead_code)]
+    pub fn size(&self) -> vk::DeviceSize {
+        self.size
     }
 }
 
-/// A single buffer which holds it's own memory.
-pub struct Buffer {
-    pub view: BufferView,
-    pub block: MemoryBlock,
+impl Drop for MemoryBlockShared {
+    fn drop(&mut self) {
+        unsafe { self.device.handle.free_memory(self.handle, None); }
+    }
 }
 
-impl ops::Deref for Buffer {
-    type Target = BufferView;
+#[derive(Clone)]
+pub struct MemoryBlock {
+    shared: Rc<MemoryBlockShared>, 
+}
+
+impl ops::Deref for MemoryBlock {
+    type Target = MemoryBlockShared;
 
     fn deref(&self) -> &Self::Target {
-        &self.view
+        &self.shared
     }
+}
+
+impl PartialEq for MemoryBlock {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::<MemoryBlockShared>::as_ptr(&self.shared)
+            == Rc::<MemoryBlockShared>::as_ptr(&other.shared)
+    }
+}
+
+impl Eq for MemoryBlock {}
+
+impl MemoryBlock {
+    fn new(
+        device: &Device,
+        properties: vk::MemoryPropertyFlags,
+        info: &vk::MemoryAllocateInfo,
+    ) -> Result<Self> {
+        Ok(Self {
+            shared: Rc::new(MemoryBlockShared::new(device, properties, info)?)
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct Buffer {
+    pub handle: vk::Buffer,
+    pub block: MemoryBlock,
+    pub range: MemoryRange,
 }
 
 impl Buffer {
@@ -205,201 +151,101 @@ impl Buffer {
             .memory_type_index(memory_type);
         let mut alloc_flags = vk::MemoryAllocateFlagsInfo::builder();
 
-        if info
-            .usage
-            .contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
-        {
+        if info.usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
             alloc_flags = alloc_flags
                 .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS_KHR)
                 .device_mask(1);
             alloc_info = alloc_info.push_next(&mut alloc_flags);
         }
 
-        let block = MemoryBlock::allocate(device, memory_flags, &alloc_info)?;
-        unsafe {
-            device.handle.bind_buffer_memory(handle, block.handle, 0)?;
-        }
+        let block = MemoryBlock::new(device, memory_flags, &alloc_info)?;
+        unsafe { device.handle.bind_buffer_memory(handle, block.handle, 0)?; }
 
-        let view = BufferView {
-            handle,
-            range: 0..block.size,
-        };
-
-        Ok(Self { view, block })
+        Ok(Self { handle, range: 0..block.size, block })
     }
 
-    pub fn size(&self) -> vk::DeviceSize {
-        self.view.size()
-    }
-
-    /// Destroy the buffer and free the memory.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        self.view.destroy(device);
-        self.block.free(device);
-    }
-}
-
-/// A single buffer which doesn't own the memory.
-///
-/// This means that it implicitly has the lifetime the [`MemoryBlock`] owning the memory, and more
-/// common it's parent [`Buffers`] object.
-///
-/// # Safety
-///
-/// Don't use the buffer after deallocating it's [`MemoryBlock`].
-#[derive(Debug, Clone)]
-pub struct BufferView {
-    pub handle: vk::Buffer,
-    pub range: MemoryRange,
-}
-
-impl BufferView {
     pub fn size(&self) -> vk::DeviceSize {
         self.range.end - self.range.start
     }
+}
 
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        device.handle.destroy_buffer(self.handle, None);
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        unsafe { self.block.device.handle.destroy_buffer(self.handle, None); }
     }
 }
 
-/// An aggregate collection of buffers.
-///
-/// All the buffers are stored in a single [`MemoryBlock`], meaning that all the buffers share the
-/// same memory properties.
-///
-/// This is useful as you often store many buffers with the same lifetime and memory properties.
-/// Having them all bunched together have several advantages. It mostly alliviates the need for
-/// an general purpose allocator such as VMA, as the number of allocations you need can become very
-/// low.
-///
-/// It's also very convenient when uploading data to the GPU. You could in theory have a whole
-/// scene in a big binary blob, and just upload it all in one go to a collection of buffers.
-///
-/// Copying staging buffers to device buffers also becomes easy as you just create buffers in
-/// device memory with the same layout as a collection of buffers in host memory, and go through
-/// each pair of buffers and copy them over.
-pub struct Buffers {
-    pub block: MemoryBlock,
-    pub buffers: Vec<BufferView>,
-}
+pub fn create_buffers(
+    device: &Device,
+    create_infos: &[vk::BufferCreateInfo],
+    memory_flags: vk::MemoryPropertyFlags,
+    alignment: vk::DeviceSize,
+) -> Result<(Vec<Buffer>, MemoryBlock)> {
+    let mut memory_type_bits = u32::MAX;
+    let mut current_size = 0;
 
-impl ops::Index<usize> for Buffers {
-    type Output = BufferView;
+    let buffers: Result<SmallVec<[_; 12]>> = create_infos
+        .iter()
+        .map(|info| unsafe {
+            let handle = device.handle.create_buffer(info, None)?;
+            let requirements = device.handle.get_buffer_memory_requirements(handle);
 
-    fn index(&self, idx: usize) -> &Self::Output {
-        &self.buffers[idx]
+            memory_type_bits &= requirements.memory_type_bits;
+
+            // Find an aligment that fits both that of `alignemnt` and the alignment required
+            // by the buffer.
+            let alignment = util::lcm(alignment, requirements.alignment);
+
+            // Round `current_size` up to the next integer which has the alignment of
+            // `alignment`.
+            let start = util::align_up_to(current_size, alignment);
+            let end = start + info.size;
+
+            current_size = start + requirements.size;
+
+            Ok((handle, start..end))
+        })
+        .collect();
+
+    let buffers = buffers?;
+
+    let memory_type =
+        memory_type_index(&device.memory_properties, memory_flags, memory_type_bits)
+            .ok_or_else(|| anyhow!("no compatible memory type"))?;
+
+    let mut alloc_info = vk::MemoryAllocateInfo::builder()
+        .allocation_size(current_size)
+        .memory_type_index(memory_type);
+
+    let mut flags = vk::MemoryAllocateFlagsInfo::builder();
+    if create_infos.iter().any(|info| {
+        info.usage
+            .contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+    }) {
+        flags = flags
+            .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS_KHR)
+            .device_mask(1);
+        alloc_info = alloc_info.push_next(&mut flags)
     }
-}
 
-impl Buffers {
-    /// Buffers are often stored in chunks of the same size. This is an easy way to iterate over
-    /// said chunks.
-    #[allow(unused)]
-    pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = &[BufferView]> {
-        self.buffers.as_slice().chunks(chunk_size)
-    }
+    let block = MemoryBlock::new(device, memory_flags, &alloc_info)?;
 
-    pub fn iter(&self) -> impl Iterator<Item = &BufferView> {
-        self.buffers.iter()
-    }
+    let buffers: Vec<_> = buffers
+        .into_iter()
+        .map(|(handle, range)| Buffer {
+            block: block.clone(),
+            handle,
+            range,
+        })
+        .collect();
 
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.buffers.len()
-    }
-
-    /// Create new collection of buffers allocated in a single memory block.
-    ///
-    /// The info about each buffer is determined by `create_infos`, and the resulting buffers will
-    /// be in the same order.
-    ///
-    /// All the buffers are guaranteed to be aligned to `alignment`.
-    pub fn new(
-        device: &Device,
-        create_infos: &[vk::BufferCreateInfo],
-        memory_flags: vk::MemoryPropertyFlags,
-        alignment: vk::DeviceSize,
-    ) -> Result<Buffers> {
-        let mut memory_type_bits = u32::MAX;
-        let mut current_size = 0;
-
-        let buffers: Result<Vec<_>> = create_infos
-            .iter()
-            .map(|info| unsafe {
-                let handle = device.handle.create_buffer(info, None)?;
-                let requirements = device.handle.get_buffer_memory_requirements(handle);
-
-                memory_type_bits &= requirements.memory_type_bits;
-
-                // Find an aligment that fits both that of `alignemnt` and the alignment required
-                // by the buffer.
-                let alignment = util::lcm(alignment, requirements.alignment);
-
-                // Round `current_size` up to the next integer which has the alignment of
-                // `alignment`.
-                let start = util::align_up_to(current_size, alignment);
-                let end = start + info.size;
-
-                current_size = start + requirements.size;
-
-                Ok(BufferView {
-                    handle,
-                    range: start..end,
-                })
-            })
-            .collect();
-
-        let buffers = buffers?;
-
-        let memory_type =
-            memory_type_index(&device.memory_properties, memory_flags, memory_type_bits)
-                .ok_or_else(|| anyhow!("no compatible memory type"))?;
-
-        let mut alloc_info = vk::MemoryAllocateInfo::builder()
-            .allocation_size(current_size)
-            .memory_type_index(memory_type);
-
-        let mut flags = vk::MemoryAllocateFlagsInfo::builder();
-        if create_infos.iter().any(|info| {
-            info.usage
-                .contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
-        }) {
-            flags = flags
-                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS_KHR)
-                .device_mask(1);
-            alloc_info = alloc_info.push_next(&mut flags)
+    for buffer in &buffers {
+        unsafe {
+            device.handle.bind_buffer_memory(buffer.handle, block.handle, buffer.range.start)?;
         }
-
-        let block = MemoryBlock::allocate(device, memory_flags, &alloc_info)?;
-
-        for buffer in &buffers {
-            block.bind_buffer_view(device, &buffer)?;
-        }
-
-        Ok(Self { buffers, block })
     }
 
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        for buffer in &self.buffers {
-            buffer.destroy(device);
-        }
-        self.block.free(device);
-    }
+    Ok((buffers, block))
 }
 
 /// A single image and image view which doesn't own it's own memory.
@@ -418,13 +264,56 @@ pub struct Image {
     pub layout: vk::ImageLayout,
     pub format: vk::Format,
     pub extent: vk::Extent3D,
+
     pub range: MemoryRange,
+    pub block: MemoryBlock,
 }
 
 impl Image {
-    /// The size of the image in bytes.
     pub fn size(&self) -> vk::DeviceSize {
         self.range.end - self.range.start
+    }
+
+    pub fn new(
+        device: &Device,
+        image_info: vk::ImageCreateInfo,
+        mut view_info: vk::ImageViewCreateInfo,
+        memory_flags: vk::MemoryPropertyFlags,
+    ) -> Result<Self> {
+        let handle = unsafe { device.handle.create_image(&image_info, None)? };
+        let requirements = unsafe { device.handle.get_image_memory_requirements(handle) };
+
+        let Some(memory_type) = memory_type_index(
+            &device.memory_properties,
+            memory_flags,
+            requirements.memory_type_bits,
+        ) else {
+            return Err(anyhow!("no compatible memory type"));
+        };
+
+        let block = {
+            let alloc_info = vk::MemoryAllocateInfo::builder()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type);
+            MemoryBlock::new(device, memory_flags, &alloc_info)?
+        };
+
+        unsafe { device.handle.bind_image_memory(handle, block.handle, 0)?; }
+
+        let view = unsafe {
+            view_info.image = handle;
+            device.handle.create_image_view(&view_info, None)?
+        };
+
+        Ok(Image {
+            layout: image_info.initial_layout,
+            extent: image_info.extent,
+            format: image_info.format,
+            range: 0..requirements.size,
+            handle,
+            view,
+            block,
+        })
     }
 
     /// Transition the layout of the image to `new`.
@@ -499,165 +388,142 @@ impl Image {
 
         Ok(())
     }
-
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        device.handle.destroy_image(self.handle, None);
-        device.handle.destroy_image_view(self.view, None);
-    }
 }
 
-/// An aggregate collection of images all located in a single memory block.
-pub struct Images {
-    pub images: Vec<Image>,
-    pub block: MemoryBlock,
-}
-
-impl ops::Index<usize> for Images {
-    type Output = Image;
-
-    fn index(&self, idx: usize) -> &Self::Output {
-        &self.images[idx]
-    }
-}
-
-impl Images {
-    pub fn iter(&self) -> impl Iterator<Item = &Image> {
-        self.images.iter()
-    }
-
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Image> {
-        self.images.iter_mut()
-    }
-
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.images.len()
-    }
-
-    /// Images are often stored in chunks of the same size. This is an easy way to iterate over
-    /// said chunks.
-    pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = &[Image]> {
-        self.images.as_slice().chunks(chunk_size)
-    }
-
-    /// Allocate and create a collection of images and image infos.
-    ///
-    /// # Panic
-    ///
-    /// * If the length of `image_infos` and `view_infos` aren't the same.
-    /// * If the format of the same index into `image_infos` and `view_infos` aren't the same.
-    pub fn new(
-        device: &Device,
-        image_infos: &[vk::ImageCreateInfo],
-        view_infos: &[vk::ImageViewCreateInfo],
-        memory_flags: vk::MemoryPropertyFlags,
-    ) -> Result<Self> {
-        assert_eq!(
-            image_infos.len(),
-            view_infos.len(),
-            "`image_infos` and `view_infos` are not same length"
-        );
-
-        let mut memory_type_bits = u32::MAX;
-        let mut current_size = 0;
-
-        let images: Result<Vec<_>> = image_infos
-            .iter()
-            .zip(view_infos.iter())
-            .map(|(image_info, view_info)| {
-                assert_eq!(
-                    view_info.format, image_info.format,
-                    "image format and view format not the same"
-                );
-
-                let handle = unsafe { device.handle.create_image(image_info, None)? };
-                let requirements = unsafe { device.handle.get_image_memory_requirements(handle) };
-
-                let start = util::align_up_to(current_size, requirements.alignment);
-                let end = start + requirements.size;
-
-                memory_type_bits &= requirements.memory_type_bits;
-                current_size = end;
-
-                Ok(Image {
-                    handle,
-                    extent: image_info.extent,
-                    layout: image_info.initial_layout,
-                    format: image_info.format,
-                    view: vk::ImageView::null(),
-                    range: start..end,
-                })
-            })
-            .collect();
-
-        let mut images = images?;
-
-        let memory_type =
-            memory_type_index(&device.memory_properties, memory_flags, memory_type_bits)
-                .ok_or_else(|| anyhow!("no compatible memory type"))?;
-
-        let block = {
-            let alloc_info = vk::MemoryAllocateInfo::builder()
-                .allocation_size(current_size)
-                .memory_type_index(memory_type);
-            MemoryBlock::allocate(device, memory_flags, &alloc_info)?
-        };
-
-        for (image, view_info) in images.iter_mut().zip(view_infos.iter()) {
-            image.view = unsafe {
-                device
-                    .handle
-                    .bind_image_memory(image.handle, block.handle, image.range.start)?;
-
-                let mut info = view_info.clone();
-                info.image = image.handle;
-
-                device.handle.create_image_view(&info, None)?
-            };
+impl Drop for Image {
+    fn drop(&mut self) {
+        unsafe {
+            self.block.device.handle.destroy_image(self.handle, None);
+            self.block.device.handle.destroy_image_view(self.view, None);
         }
-
-        Ok(Self { images, block })
-    }
-
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    #[allow(dead_code)]
-    pub unsafe fn destroy(&self, device: &Device) {
-        self.images.iter().for_each(|image| image.destroy(device));
-        self.block.free(device);
     }
 }
 
-pub fn create_texture_sampler(device: &Device) -> Result<vk::Sampler> {
-    let create_info = vk::SamplerCreateInfo::builder()
-        .mag_filter(vk::Filter::LINEAR)
-        .min_filter(vk::Filter::LINEAR)
-        .address_mode_u(vk::SamplerAddressMode::REPEAT)
-        .address_mode_v(vk::SamplerAddressMode::REPEAT)
-        .address_mode_w(vk::SamplerAddressMode::REPEAT)
-        .anisotropy_enable(true)
-        .max_anisotropy(device.device_properties.limits.max_sampler_anisotropy)
-        .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
-        .unnormalized_coordinates(false)
-        .compare_enable(false)
-        .compare_op(vk::CompareOp::ALWAYS)
-        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-        .mip_lod_bias(0.0)
-        .min_lod(0.0)
-        .max_lod(0.0);
-    Ok(unsafe {
-        device.handle.create_sampler(&create_info, None)?
-    })
+pub fn create_images(
+    device: &Device,
+    image_infos: &[vk::ImageCreateInfo],
+    view_infos: &[vk::ImageViewCreateInfo],
+    memory_flags: vk::MemoryPropertyFlags,
+) -> Result<(Vec<Image>, MemoryBlock)> {
+    assert_eq!(
+        image_infos.len(),
+        view_infos.len(),
+        "`image_infos` and `view_infos` are not same length"
+    );
+
+    let mut memory_type_bits = u32::MAX;
+    let mut current_size = 0;
+
+    struct TempImage {
+        handle: vk::Image,
+        layout: vk::ImageLayout,
+        format: vk::Format,
+        extent: vk::Extent3D,
+        range: MemoryRange,
+    }
+
+    let images: Result<SmallVec<[_; 8]>> = image_infos
+        .iter()
+        .zip(view_infos.iter())
+        .map(|(image_info, view_info)| {
+            assert_eq!(
+                view_info.format, image_info.format,
+                "image format and view format not the same"
+            );
+
+            let handle = unsafe { device.handle.create_image(image_info, None)? };
+            let requirements = unsafe { device.handle.get_image_memory_requirements(handle) };
+
+            let start = util::align_up_to(current_size, requirements.alignment);
+            let end = start + requirements.size;
+
+            memory_type_bits &= requirements.memory_type_bits;
+            current_size = end;
+
+            Ok(TempImage {
+                handle,
+                extent: image_info.extent,
+                layout: image_info.initial_layout,
+                format: image_info.format,
+                range: start..end,
+            })
+        })
+        .collect();
+
+    let mut images = images?;
+
+    let memory_type =
+        memory_type_index(&device.memory_properties, memory_flags, memory_type_bits)
+            .ok_or_else(|| anyhow!("no compatible memory type"))?;
+
+    let block = {
+        let alloc_info = vk::MemoryAllocateInfo::builder()
+            .allocation_size(current_size)
+            .memory_type_index(memory_type);
+        MemoryBlock::new(device, memory_flags, &alloc_info)?
+    };
+
+    let images: Result<Vec<_>> = images
+        .iter_mut()
+        .zip(view_infos.iter())
+        .map(|(image, view_info)| unsafe {
+            device.handle.bind_image_memory(image.handle, block.handle, image.range.start)?;  
+
+            let mut info = view_info.clone();
+            info.image = image.handle;
+
+            let view = device.handle.create_image_view(&info, None)?;
+
+            Ok(Image {
+                handle: image.handle,
+                layout: image.layout,
+                format: image.format,
+                extent: image.extent,
+                range: image.range.clone(),
+                block: block.clone(),
+                view,
+            })
+        })
+        .collect();
+
+    Ok((images?, block.clone()))
 }
 
+pub struct TextureSampler {
+    pub handle: vk::Sampler,
+    device: Device,
+}
+
+impl TextureSampler {
+    pub fn new(device: &Device) -> Result<Self> {
+        let create_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .anisotropy_enable(true)
+            .max_anisotropy(device.device_properties.limits.max_sampler_anisotropy)
+            .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+            .unnormalized_coordinates(false)
+            .compare_enable(false)
+            .compare_op(vk::CompareOp::ALWAYS)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .mip_lod_bias(0.0)
+            .min_lod(0.0)
+            .max_lod(0.0);
+        let handle = unsafe { device.handle.create_sampler(&create_info, None)? };
+        Ok(Self { handle, device: device.clone() })
+    }
+}
+
+impl Drop for TextureSampler {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.handle.destroy_sampler(self.handle, None);
+        }
+    }
+}
 
 /// Find a memory type index fitting `props`, `flags` and `memory_type_bits`.
 ///

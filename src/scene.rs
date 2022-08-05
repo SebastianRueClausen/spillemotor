@@ -18,10 +18,9 @@ use crate::core::{
     DescriptorSet,
     DescriptorBinding,
     BindingKind,
-    DescriptorLayoutCache,
     CameraUniforms,
 };
-use crate::resource::{self, Images, Buffers, BufferView};
+use crate::resource::{self, Buffer, Image, MappedMemory, TextureSampler};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -65,20 +64,9 @@ pub struct Material {
     pub descriptor: DescriptorSet,
 }
 
-impl Material {
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        self.descriptor.destroy(device);
-    }
-}
-
 pub struct Materials {
-    pub images: Images, 
-    pub sampler: vk::Sampler,
+    pub images: Vec<Image>, 
+    pub sampler: TextureSampler,
     materials: Vec<Material>,
 }
 
@@ -90,34 +78,18 @@ impl Index<usize> for Materials {
     }
 }
 
-impl Materials {
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        device.handle.destroy_sampler(self.sampler, None);
-        self.images.destroy(device);
-        for mat in &self.materials {
-            mat.destroy(device);
-        }
-    }
-}
-
 pub struct Scene {
     pub lights: Lights,
     pub render_pipeline: Pipeline,
     pub light_descriptor: DescriptorSet,
     pub materials: Materials,
     pub models: Vec<Model>,
-    pub buffers: Buffers,
+    pub buffers: Vec<Buffer>,
 }
 
 impl Scene {
     pub fn from_scene_data(
         device: &Device,
-        layout_cache: &mut DescriptorLayoutCache,
         swapchain: &Swapchain,
         render_pass: &RenderPass,
         render_targets: &RenderTargets,
@@ -145,7 +117,6 @@ impl Scene {
 
         let lights = Lights::new(
             device,
-            layout_cache,
             &camera_uniforms,
             &camera,
             &swapchain,
@@ -165,19 +136,22 @@ impl Scene {
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .build(),
             ];
+
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            Buffers::new(device, &create_infos, memory_flags, 4)?
-        };
 
-        staging.block.map_with(device, |mapped| {
+            let (buffers, block) = resource::create_buffers(device, &create_infos, memory_flags, 4)?;
+            let mapped = MappedMemory::new(&block)?;
+
             [scene_data.vertex_data.as_slice(), scene_data.index_data.as_slice()]
                 .iter()
-                .zip(staging.buffers.iter())
-                .for_each(|(src, dst)| unsafe {
-                    mapped.get_range(dst.range.clone()).copy_from_slice(&src);
+                .zip(buffers.iter())
+                .for_each(|(data, buffer)| {
+                    mapped.get_buffer_data(buffer).copy_from_slice(&data);
                 });
-        })?;
+
+            buffers
+        };
 
         let buffers = {
             let create_infos = [
@@ -197,7 +171,15 @@ impl Scene {
                     .sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .build(),
             ];
-            Buffers::new(device, &create_infos, vk::MemoryPropertyFlags::DEVICE_LOCAL, 4)?
+
+            let (buffers, _) = resource::create_buffers(
+                device,
+                &create_infos,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                4,
+            )?;
+
+            buffers
         };
 
         device.transfer_with(|command_buffer| {
@@ -220,8 +202,6 @@ impl Scene {
             }
         })?;
 
-        unsafe { staging.destroy(device); }
-
         let staging = {
             let create_infos: Vec<_> = scene_data.materials
                 .iter()
@@ -243,12 +223,13 @@ impl Scene {
                         .build(),
                 ])
                 .collect();
+
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            Buffers::new(device, &create_infos, memory_flags, 4)?
-        };
 
-        staging.block.map_with(device, |mapped| {
+            let (staging, block) = resource::create_buffers(device, &create_infos, memory_flags, 4)?;
+            let mapped = MappedMemory::new(&block)?;
+           
             scene_data.materials
                 .iter()
                 .flat_map(|mat| [
@@ -257,10 +238,12 @@ impl Scene {
                     mat.metallic_roughness.data.as_slice(),
                 ])
                 .zip(staging.iter())
-                .for_each(|(src, dst)| unsafe {
-                    mapped.get_range(dst.range.clone()).copy_from_slice(&src);
+                .for_each(|(data, buffer)| {
+                    mapped.get_buffer_data(buffer).copy_from_slice(&data);
                 });
-        })?;
+
+            staging
+        };
 
         let mut images = {
             let image_infos: Vec<_> = scene_data.materials
@@ -315,7 +298,6 @@ impl Scene {
                             .format(format)
                             .build()
                     }
-
                     [
                         view_info(vk::Format::R8G8B8A8_SRGB),
                         view_info(vk::Format::R8G8B8A8_UNORM),
@@ -324,7 +306,14 @@ impl Scene {
                 })
                 .collect();
 
-            Images::new(device, &image_infos, &view_infos, vk::MemoryPropertyFlags::DEVICE_LOCAL)?
+            let (images, _) = resource::create_images(
+                device,
+                &image_infos,
+                &view_infos,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+
+            images
         };
 
         for image in images.iter_mut() {
@@ -362,8 +351,6 @@ impl Scene {
             }
         })?;
 
-        unsafe { staging.destroy(device); }
-
         for image in images.iter_mut() {
             image.transition_layout(device, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
         }
@@ -386,7 +373,7 @@ impl Scene {
             })
             .collect();
 
-        let light_descriptor = DescriptorSet::new(device, layout_cache, &[
+        let light_descriptor = DescriptorSet::new(device, &[
             DescriptorBinding {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
@@ -413,7 +400,8 @@ impl Scene {
             },
         ])?;
 
-        let sampler = resource::create_texture_sampler(device)?;
+        let sampler = TextureSampler::new(device)?;
+
         let materials: Result<Vec<_>> = scene_data.materials
             .iter()
             .enumerate()
@@ -424,7 +412,7 @@ impl Scene {
                 let normal_index = base + 1;
                 let metallic_roughness_index = base + 2;
 
-                let descriptor = DescriptorSet::new(device, layout_cache, &[
+                let descriptor = DescriptorSet::new(device, &[
                     DescriptorBinding {
                         ty: vk::DescriptorType::UNIFORM_BUFFER,
                         stage: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
@@ -444,7 +432,7 @@ impl Scene {
                     DescriptorBinding {
                         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                         stage: vk::ShaderStageFlags::FRAGMENT,
-                        kind: BindingKind::Image(sampler, [
+                        kind: BindingKind::Image(&sampler, [
                             &images[base_color_index],
                             &images[base_color_index],
                         ]),
@@ -452,7 +440,7 @@ impl Scene {
                     DescriptorBinding {
                         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                         stage: vk::ShaderStageFlags::FRAGMENT,
-                        kind: BindingKind::Image(sampler, [
+                        kind: BindingKind::Image(&sampler, [
                             &images[normal_index],
                             &images[normal_index],
                         ]),
@@ -460,7 +448,7 @@ impl Scene {
                     DescriptorBinding {
                         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                         stage: vk::ShaderStageFlags::FRAGMENT,
-                        kind: BindingKind::Image(sampler, [
+                        kind: BindingKind::Image(&sampler, [
                             &images[metallic_roughness_index],
                             &images[metallic_roughness_index],
                         ]),
@@ -564,19 +552,10 @@ impl Scene {
                 render_targets,
             })?;
 
-            unsafe {
-                vertex_module.destroy(device); 
-                fragment_module.destroy(device); 
-            }
-
             pipeline
         };
 
-        let materials = Materials {
-            images,
-            sampler,
-            materials,
-        };
+        let materials = Materials { images, sampler, materials };
 
         Ok(Self {
             lights,
@@ -588,11 +567,11 @@ impl Scene {
         })
     }
 
-    pub fn vertex_buffer(&mut self) -> &BufferView {
+    pub fn vertex_buffer(&mut self) -> &Buffer {
         &self.buffers[0]
     }
 
-    pub fn index_buffer(&mut self) -> &BufferView {
+    pub fn index_buffer(&mut self) -> &Buffer {
         &self.buffers[1]
     }
 
@@ -603,19 +582,6 @@ impl Scene {
         swapchain: &Swapchain,
     ) -> Result<()> {
         self.lights.handle_resize(device, camera, swapchain)
-    }
-
-    /// Destroy and leave `self` in an invalid state.
-    ///
-    /// # Safety
-    ///
-    /// Don't use `self` after calling this function.
-    pub unsafe fn destroy(&self, device: &Device) {
-        self.lights.destroy(device);
-        self.light_descriptor.destroy(device);
-        self.materials.destroy(device);
-        self.buffers.destroy(device);
-        self.render_pipeline.destroy(device);
     }
 }
 
