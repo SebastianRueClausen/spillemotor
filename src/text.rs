@@ -149,34 +149,11 @@ impl TextPass {
             Image::new(device, *image_info, *view_info, vk::MemoryPropertyFlags::DEVICE_LOCAL)?
         };
 
-        glyph_atlas.transition_layout(device, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
-
-        device.transfer_with(|command_buffer| {
-            let subresource = vk::ImageSubresourceLayers::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(0)
-                .base_array_layer(0)
-                .layer_count(1)
-                .build();
-            let regions = [vk::BufferImageCopy::builder()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_extent(extent)
-                .image_subresource(subresource)
-                .build()];
-            unsafe {
-                device.handle.cmd_copy_buffer_to_image(
-                    command_buffer,
-                    staging.handle,
-                    glyph_atlas.handle,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &regions,
-                );
-            }
+        device.transfer_with(|recorder| {
+            recorder.transition_image_layout(&mut glyph_atlas, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            recorder.copy_buffer_to_image(&staging, &glyph_atlas);
+            recorder.transition_image_layout(&mut glyph_atlas, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         })?;
-
-        glyph_atlas.transition_layout(device, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
 
         let descriptor = DescriptorSet::new(device, &[
             DescriptorBinding {

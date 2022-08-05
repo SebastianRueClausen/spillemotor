@@ -317,20 +317,8 @@ impl Lights {
             buffer
         };
 
-        device.transfer_with(|command_buffer| unsafe {
-            let light_buffer = &buffers[0];
-            assert_eq!(light_buffer.size(), light_staging.size());
-            let regions = [vk::BufferCopy::builder()
-                .src_offset(0)
-                .dst_offset(0)
-                .size(light_staging.size())
-                .build()];
-            device.handle.cmd_copy_buffer(
-                command_buffer,
-                light_staging.handle,
-                light_buffer.handle,
-                &regions,
-            );
+        device.transfer_with(|recorder| {
+            recorder.copy_buffers(&light_staging, &buffers[0]);
         })?;
 
         let cluster_build = {
@@ -458,15 +446,15 @@ impl Lights {
     }
 
     fn build_clusters(&self, device: &Device) -> Result<()> {
-        device.transfer_with(|command_buffer| unsafe {
+        device.transfer_with(|recorder| unsafe {
             device.handle.cmd_bind_pipeline(
-                command_buffer,
+                recorder.buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.cluster_build.pipeline.handle,
             );
 
             device.handle.cmd_bind_descriptor_sets(
-                command_buffer,
+                recorder.buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.cluster_build.pipeline.layout,
                 0,
@@ -477,7 +465,7 @@ impl Lights {
             let subdivisions = self.cluster_info.info.cluster_subdivisions();
 
             device.handle.cmd_dispatch(
-                command_buffer,
+                recorder.buffer,
                 subdivisions.x,
                 subdivisions.y,
                 subdivisions.z,

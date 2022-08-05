@@ -270,6 +270,7 @@ pub struct Image {
 }
 
 impl Image {
+    #[allow(dead_code)]
     pub fn size(&self) -> vk::DeviceSize {
         self.range.end - self.range.start
     }
@@ -315,79 +316,6 @@ impl Image {
             block,
         })
     }
-
-    /// Transition the layout of the image to `new`.
-    ///
-    /// For now it handles two transitions (`format` references the current layout of the image):
-    ///
-    /// | `format`               | `new`                      |
-    /// |------------------------|----------------------------|
-    /// | `UNDEFINED`            | `TRANSFER_DST_OPTIMAL`     |
-    /// | `TRANSFER_DST_OPTIMAL` | `SHADER_READ_ONLY_OPTIMAL` |
-    ///
-    /// The transition will fail if the transfer doesn't fit into the tabel.
-    pub fn transition_layout(&mut self, device: &Device, new: vk::ImageLayout) -> Result<()> {
-        device.transfer_with(|cmd| {
-            let subresource = vk::ImageSubresourceRange::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1)
-                .build();
-            let mut barrier = vk::ImageMemoryBarrier::builder()
-                .image(self.handle)
-                .old_layout(self.layout)
-                .new_layout(new)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .subresource_range(subresource);
-
-            let (src_stage, dst_stage) = match (self.layout, new) {
-                (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => {
-                    barrier = barrier
-                        .src_access_mask(vk::AccessFlags::empty())
-                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-                    (
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
-                        vk::PipelineStageFlags::TRANSFER,
-                    )
-                }
-                (
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                ) => {
-                    barrier = barrier
-                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ);
-                    (
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    )
-                }
-                _ => {
-                    todo!()
-                }
-            };
-
-            self.layout = new;
-
-            unsafe {
-                let barriers = [barrier.build()];
-                device.handle.cmd_pipeline_barrier(
-                    cmd,
-                    src_stage,
-                    dst_stage,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &barriers,
-                );
-            }
-        })?;
-
-        Ok(())
-    }
 }
 
 impl Drop for Image {
@@ -428,7 +356,7 @@ pub fn create_images(
         .map(|(image_info, view_info)| {
             assert_eq!(
                 view_info.format, image_info.format,
-                "image format and view format not the same"
+                "image format and view format not the same",
             );
 
             let handle = unsafe { device.handle.create_image(image_info, None)? };

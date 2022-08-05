@@ -716,8 +716,9 @@ impl DeviceShared {
     /// immediately, meaning that the transfer will be done before this function returns.
     pub fn transfer_with<F, R>(&self, func: F) -> Result<R>
     where
-        F: FnOnce(vk::CommandBuffer) -> R
+        F: FnOnce(&CommandRecorder) -> R
     {
+        // TODO: Avoid creating a new command buffer each time.
         let buffers = unsafe {
             let info = vk::CommandBufferAllocateInfo::builder()
                 .level(vk::CommandBufferLevel::PRIMARY)
@@ -725,18 +726,12 @@ impl DeviceShared {
                 .command_buffer_count(1);
             self.handle.allocate_command_buffers(&info)?
         };
-        unsafe {
-            let begin_info = vk::CommandBufferBeginInfo::builder()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.handle.begin_command_buffer(buffers[0], &begin_info)?;
-        }
 
-        let ret = func(buffers[0]);
+        let recorder = CommandRecorder::new(self.handle.clone(), buffers[0])?;
+        let ret = func(&recorder);
+        self.transfer_queue.submit_commands(recorder)?;
 
         unsafe {
-            self.handle.end_command_buffer(buffers[0])?;
-            let submit_info = [vk::SubmitInfo::builder().command_buffers(&buffers).build()];
-            self.handle.queue_submit(self.transfer_queue.handle, &submit_info, vk::Fence::null())?;
             self.handle.queue_wait_idle(self.transfer_queue.handle)?;
             self.handle.free_command_buffers(self.transfer_pool, &buffers);
         }
@@ -1003,6 +998,22 @@ impl Queue {
             handle: unsafe { device.get_device_queue(family_index, 0) },
             family_index,
         }
+    }
+
+    fn submit_commands(&self, recorder: CommandRecorder) -> Result<()> {
+        let device = &recorder.device;
+
+        let buffers = [recorder.buffer];
+        let submit_infos = [vk::SubmitInfo::builder()
+            .command_buffers(&buffers)
+            .build()];
+
+        unsafe {
+            device.end_command_buffer(recorder.buffer)?;
+            device.queue_submit(self.handle, &submit_infos, vk::Fence::null())?;
+        }
+        
+        Ok(())
     }
 }
 
@@ -2070,6 +2081,138 @@ impl Drop for Pipeline {
         unsafe {
             self.device.handle.destroy_pipeline(self.handle, None);
             self.device.handle.destroy_pipeline_layout(self.layout, None);
+        }
+    }
+}
+
+pub struct CommandRecorder {
+    pub buffer: vk::CommandBuffer,
+
+    // TODO: Make this `Device` when we do some refactoring.
+    device: ash::Device,
+}
+
+impl CommandRecorder {
+    fn new(device: ash::Device, buffer: vk::CommandBuffer) -> Result<Self> {
+        unsafe {
+            let begin_info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device.begin_command_buffer(buffer, &begin_info)?;
+        }
+
+        Ok(Self { buffer, device: device.clone() })
+    }
+
+    pub fn copy_buffers(&self, src: &Buffer, dst: &Buffer) {
+        let size = src.size().min(dst.size());
+        let regions = [vk::BufferCopy::builder()
+            .src_offset(0)
+            .dst_offset(0)
+            .size(size)
+            .build()];
+        unsafe {
+            self.device.cmd_copy_buffer(
+                self.buffer,
+                src.handle,
+                dst.handle,
+                &regions,
+            );
+        }
+    }
+
+    pub fn copy_buffer_to_image(&self, src: &Buffer, dst: &Image) {
+        // NOTE: Make sure this is updated when adding mip levels.
+        let subresource = vk::ImageSubresourceLayers::builder()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .base_array_layer(0)
+            .layer_count(1)
+            .build();
+        let regions = [vk::BufferImageCopy::builder()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_extent(dst.extent)
+            .image_subresource(subresource)
+            .build()];
+        unsafe {
+            self.device.cmd_copy_buffer_to_image(
+                self.buffer,
+                src.handle,
+                dst.handle,
+                dst.layout,
+                &regions,
+            );
+        }
+    }
+
+    /// Transition the layout of `image` to `new`.
+    ///
+    /// For now it handles two transitions (format` references the current layout of the image):
+    ///
+    /// | `format`               | `new`                      |
+    /// |------------------------|----------------------------|
+    /// | `UNDEFINED`            | `TRANSFER_DST_OPTIMAL`     |
+    /// | `TRANSFER_DST_OPTIMAL` | `SHADER_READ_ONLY_OPTIMAL` |
+    ///
+    /// The transition will fail if the transfer doesn't fit into the tabel.
+    pub fn transition_image_layout(&self, image: &mut Image, new: vk::ImageLayout) {
+        // NOTE: Make sure this is updated when adding mip levels.
+        let subresource = vk::ImageSubresourceRange::builder()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1)
+            .build();
+        let mut barrier = vk::ImageMemoryBarrier::builder()
+            .image(image.handle)
+            .old_layout(image.layout)
+            .new_layout(new)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .subresource_range(subresource);
+
+        let (src_stage, dst_stage) = match (image.layout, new) {
+            (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => {
+                barrier = barrier
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                (
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                )
+            }
+            (
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            ) => {
+                barrier = barrier
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                (
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                )
+            }
+            _ => {
+                todo!()
+            }
+        };
+
+        image.layout = new;
+
+        unsafe {
+            let barriers = [barrier.build()];
+            self.device.cmd_pipeline_barrier(
+                self.buffer,
+                src_stage,
+                dst_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &barriers,
+            );
         }
     }
 }

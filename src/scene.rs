@@ -182,23 +182,9 @@ impl Scene {
             buffers
         };
 
-        device.transfer_with(|command_buffer| {
+        device.transfer_with(|recorder| {
             for (src, dst) in staging.iter().zip(buffers.iter()) {
-                assert_eq!(src.size(), dst.size());
-
-                let regions = [vk::BufferCopy::builder()
-                    .src_offset(0)
-                    .dst_offset(0)
-                    .size(src.size())
-                    .build()];
-                unsafe {
-                    device.handle.cmd_copy_buffer(
-                        command_buffer,
-                        src.handle,
-                        dst.handle,
-                        &regions,
-                    );
-                }
+                recorder.copy_buffers(src, dst);
             }
         })?;
 
@@ -316,44 +302,19 @@ impl Scene {
             images
         };
 
-        for image in images.iter_mut() {
-            image.transition_layout(device, vk::ImageLayout::TRANSFER_DST_OPTIMAL)?;
-        }
+        device.transfer_with(|recorder| {
+            for image in images.iter_mut() {
+                recorder.transition_image_layout(image, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            }
 
-        device.transfer_with(|command_buffer| {
             for (src, dst) in staging.iter().zip(images.iter()) {
-                // I think they should be the same size, but in some instance they aren't for some
-                // reason. Vulkan doesn't complain so i guess it's alright.
-                assert!(src.size() <= dst.size());
+                recorder.copy_buffer_to_image(src, dst);
+            }
 
-                let subresource = vk::ImageSubresourceLayers::builder()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .mip_level(0)
-                    .base_array_layer(0)
-                    .layer_count(1)
-                    .build();
-                let regions = [vk::BufferImageCopy::builder()
-                    .buffer_offset(0)
-                    .buffer_row_length(0)
-                    .buffer_image_height(0)
-                    .image_extent(dst.extent)
-                    .image_subresource(subresource)
-                    .build()];
-                unsafe {
-                    device.handle.cmd_copy_buffer_to_image(
-                        command_buffer,
-                        src.handle,
-                        dst.handle,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &regions,
-                    );
-                }
+            for image in images.iter_mut() {
+                recorder.transition_image_layout(image, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
             }
         })?;
-
-        for image in images.iter_mut() {
-            image.transition_layout(device, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
-        }
 
         let models: Vec<_> = scene_data.meshes
             .iter()
