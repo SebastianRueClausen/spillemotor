@@ -4,16 +4,15 @@ use anyhow::Result;
 
 use std::{iter, mem};
 
-use crate::camera::Camera;
+use crate::camera::{Camera, CameraUniforms};
 use crate::resource::{self, MappedMemory, Buffer};
 use crate::core::{
     Device,
     Swapchain,
-    Pipeline,
-    PipelineRequest,
+    ComputePipeline,
+    PipelineLayout,
     ShaderModule,
     FRAMES_IN_FLIGHT,
-    CameraUniforms,
     DescriptorSet,
     DescriptorBinding,
     BindingKind,
@@ -317,12 +316,10 @@ impl Lights {
             buffer
         };
 
-        device.transfer_with(|recorder| {
-            recorder.copy_buffers(&light_staging, &buffers[0]);
-        })?;
+        device.transfer_with(|recorder| recorder.copy_buffers(&light_staging, &buffers[0]))?;
 
         let cluster_build = {
-            let descriptor = DescriptorSet::new(device, &[
+            let descriptor = DescriptorSet::new_single(device, None, &[
                 DescriptorBinding {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
@@ -346,17 +343,14 @@ impl Lights {
             let code = include_bytes_aligned_as!(u32, "../shaders/cluster_build.spv");
             let shader = ShaderModule::new(device, "main", code)?;
 
-            let pipeline = Pipeline::new(device, PipelineRequest::Compute {
-                descriptors: &[&descriptor], 
-                push_constants: &[],
-                shader: &shader,
-            })?;
+            let layout = PipelineLayout::new(device, &[], &[descriptor.layout.clone()])?;
+            let pipeline = ComputePipeline::new(device, layout, &shader)?;
 
             ComputeProgram { pipeline, descriptor }
         };
 
         let light_update = {
-            let descriptor = DescriptorSet::new(device, &[
+            let descriptor = DescriptorSet::new_per_frame(device, None, &[
                 DescriptorBinding {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
@@ -382,17 +376,14 @@ impl Lights {
             let code = include_bytes_aligned_as!(u32, "../shaders/light_update.spv");
             let shader = ShaderModule::new(device, "main", code)?;
 
-            let pipeline = Pipeline::new(device, PipelineRequest::Compute {
-                descriptors: &[&descriptor], 
-                push_constants: &[],
-                shader: &shader,
-            })?;
+            let layout = PipelineLayout::new(device, &[], &[descriptor.layout.clone()])?;
+            let pipeline = ComputePipeline::new(device, layout, &shader)?;
 
             ComputeProgram { pipeline, descriptor }
         };
 
         let cluster_update = {
-            let descriptor = DescriptorSet::new(device, &[
+            let descriptor = DescriptorSet::new_per_frame(device, None, &[
                 // Light buffer.
                 DescriptorBinding {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -422,11 +413,8 @@ impl Lights {
             let code = include_bytes_aligned_as!(u32, "../shaders/cluster_update.spv");
             let shader = ShaderModule::new(device, "main", code)?;
 
-            let pipeline = Pipeline::new(device, PipelineRequest::Compute {
-                descriptors: &[&descriptor], 
-                push_constants: &[],
-                shader: &shader,
-            })?;
+            let layout = PipelineLayout::new(device, &[], &[descriptor.layout.clone()])?;
+            let pipeline = ComputePipeline::new(device, layout, &shader)?;
 
             ComputeProgram { pipeline, descriptor }
         };
@@ -446,30 +434,15 @@ impl Lights {
     }
 
     fn build_clusters(&self, device: &Device) -> Result<()> {
-        device.transfer_with(|recorder| unsafe {
-            device.handle.cmd_bind_pipeline(
-                recorder.buffer,
+        device.transfer_with(|recorder| {
+            recorder.bind_descriptor_sets(
                 vk::PipelineBindPoint::COMPUTE,
-                self.cluster_build.pipeline.handle,
-            );
-
-            device.handle.cmd_bind_descriptor_sets(
-                recorder.buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.cluster_build.pipeline.layout,
-                0,
-                &[self.cluster_build.descriptor[0]],
-                &[],
+                self.cluster_build.pipeline.layout(),
+                &[&self.cluster_build.descriptor],
             );
 
             let subdivisions = self.cluster_info.info.cluster_subdivisions();
-
-            device.handle.cmd_dispatch(
-                recorder.buffer,
-                subdivisions.x,
-                subdivisions.y,
-                subdivisions.z,
-            );
+            recorder.dispatch(&self.cluster_build.pipeline, subdivisions);
         })
     }
 
@@ -504,7 +477,7 @@ impl Lights {
 
 pub struct ComputeProgram {
     pub descriptor: DescriptorSet,
-    pub pipeline: Pipeline,
+    pub pipeline: ComputePipeline,
 }
 
 const MAX_LIGHT_COUNT: usize = 256;

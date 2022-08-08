@@ -1,57 +1,15 @@
-use glam::{Vec3, Mat4};
+use ash::vk;
+use glam::{Mat4, Vec2, Vec3, Vec4};
+use smallvec::SmallVec;
 use winit::event::VirtualKeyCode;
+use anyhow::Result;
 
+use std::{mem, iter};
 use std::time::Duration;
 
-#[derive(Default)]
-pub struct InputState {
-    /// Keeps track of if each `VirtualKeyCode` is pressed or not. Each key code represents a
-    /// single bit.
-    key_pressed: [u64; 3],
-    /// The current position of the mouse. `None` if no `mouse_moved` event has been received.
-    mouse_pos: Option<(f64, f64)>,
-    /// Contains the mouse position delta since last time `mouse_delta`.
-    mouse_delta: Option<(f64, f64)>,
-}
-
-impl InputState {
-    pub fn mouse_moved(&mut self, pos: (f64, f64)) {
-        let mouse_pos = self.mouse_pos.unwrap_or(pos);
-        let mouse_delta = self.mouse_delta.unwrap_or((0.0, 0.0));
-
-        self.mouse_delta = Some((
-            mouse_delta.0 + (mouse_pos.0 - pos.0),
-            mouse_delta.1 + (mouse_pos.1 - pos.1),
-        ));
-
-        self.mouse_pos = Some(pos);   
-    }
-
-    pub fn key_pressed(&mut self, key: VirtualKeyCode) {
-        let major = key as usize / 64;
-        let minor = key as usize % 64;
-
-        self.key_pressed[major] |= 1 << minor;
-    }
-
-    pub fn key_released(&mut self, key: VirtualKeyCode) {
-        let major = key as usize / 64;
-        let minor = key as usize % 64;
-    
-        self.key_pressed[major] &= !(1 << minor);
-    }
-
-    pub fn is_key_pressed(&self, key: VirtualKeyCode) -> bool {
-        let major = key as usize / 64;
-        let minor = key as usize % 64;
-   
-        self.key_pressed[major] & (1 << minor) != 0
-    }
-
-    pub fn mouse_delta(&mut self) -> (f64, f64) {
-        self.mouse_delta.take().unwrap_or((0.0, 0.0))
-    }
-}
+use crate::core::*;
+use crate::InputState;
+use crate::resource::{self, MappedMemory, Buffer};
 
 pub struct Camera {
     pub pos: Vec3,
@@ -145,3 +103,131 @@ impl Camera {
         );
     }
 }
+
+/// Data related to the camera view. This is updated every frame and has a copy per frame in
+/// flight.
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::NoUninit)]
+pub struct ViewUniform {
+    /// The position of the camera in world space.
+    eye: Vec4,
+    /// The view matrix.
+    view: Mat4,
+    /// `proj * view`. This is cached to save a dot product between two 4x4 matrices
+    /// for each vertex.
+    proj_view: Mat4,
+}
+
+impl ViewUniform {
+    pub fn new(camera: &Camera) -> Self {
+        let eye = Vec4::from((camera.pos, 0.0));
+        let proj_view = camera.proj * camera.view;
+        Self { eye, view: camera.view.clone(), proj_view }
+    }
+}
+
+/// Data related to the projection matrix. This is only updated on screen resize or camera settings
+/// changes. There is only one copy.
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::NoUninit)]
+pub struct ProjUniform {
+    /// The projection matrix.
+    proj: Mat4,
+    /// The inverse projection.
+    ///
+    /// Used to transform points from screen to view space.
+    inverse_proj: Mat4,
+    /// The screen dimensions.
+    dimensions: Vec2,
+    /// z near and z far.
+    z_plane: Vec2,
+}
+
+impl ProjUniform {
+    pub fn new(camera: &Camera, swapchain: &Swapchain) -> Self {
+        let dimensions = Vec2::new(
+            swapchain.extent.width as f32,
+            swapchain.extent.height as f32,
+        );
+        let inverse_proj = camera.proj.inverse();
+        let z_plane = Vec2::new(camera.z_near, camera.z_far);
+        Self { proj: camera.proj.clone(), inverse_proj, dimensions, z_plane }
+    }
+}
+
+/// Uniform buffers containing camera information.
+///
+/// [`ProjUniform`] is only updated when the window is resized or some camera settings are changed
+/// such as fov. It has therefore only a single copy.
+///
+/// [`ViewUniform`] is updated before every frame is rendered. It has therefore a copy for every
+/// frame in flight.
+///
+/// The buffers are laid in `buffers` as follows:
+///
+/// | Frame | Uniform |
+/// |-------|---------|
+/// |       | proj    |
+/// | 0     | view    |
+/// | 1     | view    |
+///
+pub struct CameraUniforms {
+    buffers: Vec<Buffer>,
+    mapped: MappedMemory,
+}
+
+impl CameraUniforms {
+    pub fn new(device: &Device, camera: &Camera, swapchain: &Swapchain) -> Result<Self> {
+        let proj_info = vk::BufferCreateInfo::builder()
+            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .size(mem::size_of::<ProjUniform>() as u64)
+            .build();
+        let view_info = vk::BufferCreateInfo::builder()
+            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .size(mem::size_of::<ViewUniform>() as u64)
+            .build();
+        let infos: SmallVec<[_; 3]> = iter::repeat(proj_info)
+            .take(1)
+            .chain(iter::repeat(view_info).take(FRAMES_IN_FLIGHT))
+            .collect();
+
+        let alignment = device.device_properties.limits.non_coherent_atom_size;
+        let memory_flags = vk::MemoryPropertyFlags::HOST_VISIBLE
+            | vk::MemoryPropertyFlags::HOST_COHERENT;
+
+        let (buffers, block) = resource::create_buffers(device, &infos, memory_flags, alignment)?;
+        let mapped = MappedMemory::new(&block)?;
+
+        let uniforms = Self { buffers, mapped };
+
+        uniforms.update_proj(camera, swapchain);
+
+        Ok(uniforms)
+    }
+
+    /// Update view uniform for frame with index `frame_index`.
+    pub fn update_view(&self, frame_index: usize, camera: &Camera) {
+        let view = ViewUniform::new(camera);
+        self.mapped
+            .get_buffer_data(self.view_uniform(frame_index))
+            .copy_from_slice(bytemuck::bytes_of(&view));
+    }
+
+    pub fn update_proj(&self, camera: &Camera, swapchain: &Swapchain) {
+        let proj = ProjUniform::new(camera, swapchain);
+        self.mapped
+            .get_buffer_data(self.proj_uniform())
+            .copy_from_slice(bytemuck::bytes_of(&proj));
+    }
+
+    pub fn proj_uniform(&self) -> &Buffer {
+        &self.buffers[0]
+    }
+
+    pub fn view_uniform(&self, frame: usize) -> &Buffer {
+        &self.buffers[1 + frame]
+    }
+}
+

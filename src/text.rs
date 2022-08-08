@@ -13,12 +13,13 @@ use crate::core::{
     DescriptorSet,
     Device,
     FRAMES_IN_FLIGHT,
-    Pipeline,
+    GraphicsPipeline,
+    GraphicsPipelineReq,
+    CommandRecorder,
+    PipelineLayout,
     RenderPass,
     RenderTargets,
-    PipelineRequest,
     ShaderModule,
-    Frame,
     Swapchain,
 };
 use crate::resource::{self, Buffer, Image, MappedMemory, TextureSampler};
@@ -32,7 +33,7 @@ struct Vertex {
 }
 
 pub struct TextPass {
-    pub pipeline: Pipeline,
+    pub pipeline: GraphicsPipeline,
     pub descriptor: DescriptorSet,
 
     /// Vertex and index buffers for rendering text.
@@ -155,7 +156,7 @@ impl TextPass {
             recorder.transition_image_layout(&mut glyph_atlas, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         })?;
 
-        let descriptor = DescriptorSet::new(device, &[
+        let descriptor = DescriptorSet::new_single(device, None, &[
             DescriptorBinding {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
@@ -174,15 +175,14 @@ impl TextPass {
         let vertex_module = ShaderModule::new(&device, "main", vertex_code)?;
         let fragment_module = ShaderModule::new(&device, "main", fragment_code)?;
 
-        let pipeline = Pipeline::new(device, PipelineRequest::Render {
-            descriptor_layouts: &[descriptor.layout],
-            push_constants: &[
-                vk::PushConstantRange::builder()
-                    .stage_flags(vk::ShaderStageFlags::VERTEX)
-                    .size(mem::size_of::<Mat4>() as u32)
-                    .offset(0)
-                    .build(),
-            ],
+        let push_consts = [vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .size(mem::size_of::<Mat4>() as u32)
+            .offset(0)
+            .build()];
+
+        let pipeline = GraphicsPipeline::new(device, GraphicsPipelineReq {
+            layout: PipelineLayout::new(device, &push_consts, &[descriptor.layout.clone()])?,
             vertex_attributes: &[
                 vk::VertexInputAttributeDescription {
                     format: vk::Format::R32G32B32_SFLOAT,
@@ -232,25 +232,21 @@ impl TextPass {
         self.proj = Mat4::orthographic_lh(0.0, width, 0.0, height, 0.0, 1.0);
     }
 
-    pub fn draw_text<F, R>(
-        &mut self,
-        device: &Device,
-        swapchain: &Swapchain,
-        frame: &Frame,
-        mut f: F,
-    ) -> Result<R>
+    pub fn draw_text<F>(&mut self, recorder: &CommandRecorder, mut func: F)
     where
-        F: FnMut(&mut TextObjects) -> R,
+        F: FnMut(&mut TextObjects),
     {
         self.text_objects.clear();
 
-        let ret = f(&mut self.text_objects);
+        func(&mut self.text_objects);
+
+        let frame_index = recorder.frame_index();
     
         let index_data = bytemuck::cast_slice(self.text_objects.indices.as_slice());
         let vertex_data = bytemuck::cast_slice(self.text_objects.vertices.as_slice());
 
-        let index_buffer = self.mapped.get_buffer_data(self.index_buffer(frame.index));
-        let vertex_buffer = self.mapped.get_buffer_data(self.vertex_buffer(frame.index));
+        let index_buffer = self.mapped.get_buffer_data(self.index_buffer(frame_index));
+        let vertex_buffer = self.mapped.get_buffer_data(self.vertex_buffer(frame_index));
 
         for (src, dst) in index_data.iter().zip(index_buffer.iter_mut()) {
             *dst = *src; 
@@ -260,68 +256,32 @@ impl TextPass {
             *dst = *src; 
         }
 
-        unsafe {
-            device.handle.cmd_bind_pipeline(
-                frame.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline.handle,
+        recorder.bind_graphics_pipeline(&self.pipeline);
+        recorder.bind_descriptor_sets(
+            vk::PipelineBindPoint::GRAPHICS,
+            self.pipeline.layout(),
+            &[&self.descriptor],
+        );
+
+        recorder.bind_index_buffer(self.index_buffer(frame_index));
+        recorder.bind_vertex_buffer(self.vertex_buffer(frame_index));
+
+        for label in &self.text_objects.labels {
+            let proj_transform = self.proj * Mat4::from_scale_rotation_translation(
+                Vec3::splat(label.scale),
+                Quat::IDENTITY,
+                label.pos,
             );
 
-            device.handle.cmd_set_viewport(frame.command_buffer, 0, &swapchain.viewports());
-            device.handle.cmd_set_scissor(frame.command_buffer, 0, &swapchain.scissors());
-
-            device.handle.cmd_bind_descriptor_sets(
-                frame.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline.layout,
+            recorder.push_constants(
+                self.pipeline.layout(),
+                vk::ShaderStageFlags::VERTEX,
                 0,
-                &[self.descriptor[0]],
-                &[],
-            );
-            
-            device.handle.cmd_bind_vertex_buffers(
-                frame.command_buffer,
-                0,
-                &[self.vertex_buffer(frame.index).handle],
-                &[0],
+                &proj_transform,
             );
 
-            device.handle.cmd_bind_index_buffer(
-                frame.command_buffer,
-                self.index_buffer(frame.index).handle,
-                0,
-                vk::IndexType::UINT16,
-            );
-
-            for label in &self.text_objects.labels {
-                let transform = Mat4::from_scale_rotation_translation(
-                    Vec3::splat(label.scale),
-                    Quat::IDENTITY,
-                    label.pos,
-                );
-
-                let proj_transform = self.proj * transform;
-
-                device.handle.cmd_push_constants(
-                    frame.command_buffer,
-                    self.pipeline.layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    bytemuck::bytes_of(&proj_transform),
-                );
-
-                device.handle.cmd_draw_indexed(
-                    frame.command_buffer,
-                    label.index_count,
-                    1,
-                    label.index_offset,
-                    0,
-                    0,
-                );
-            }
+            recorder.draw(label.index_count, label.index_offset, 0);
         }
-
-        Ok(ret) 
     }
 
     fn vertex_buffer(&self, frame_index: usize) -> &Buffer {

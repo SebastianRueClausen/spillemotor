@@ -5,21 +5,24 @@ use ash::vk;
 use std::mem;
 use std::ops::Index;
 
-use crate::camera::Camera;
+use crate::Camera;
 use crate::light::{PointLight, Lights};
 use crate::core::{
     Device,
     Swapchain,
     RenderPass,
     RenderTargets,
-    Pipeline,
+    GraphicsPipeline,
+    GraphicsPipelineReq,
+    PipelineLayout,
     ShaderModule,
-    PipelineRequest,
     DescriptorSet,
+    LayoutBinding,
+    DescriptorSetLayout,
     DescriptorBinding,
     BindingKind,
-    CameraUniforms,
 };
+use crate::camera::CameraUniforms;
 use crate::resource::{self, Buffer, Image, MappedMemory, TextureSampler};
 
 #[repr(C)]
@@ -80,7 +83,7 @@ impl Index<usize> for Materials {
 
 pub struct Scene {
     pub lights: Lights,
-    pub render_pipeline: Pipeline,
+    pub render_pipeline: GraphicsPipeline,
     pub light_descriptor: DescriptorSet,
     pub materials: Materials,
     pub models: Vec<Model>,
@@ -334,7 +337,7 @@ impl Scene {
             })
             .collect();
 
-        let light_descriptor = DescriptorSet::new(device, &[
+        let light_descriptor = DescriptorSet::new_per_frame(device, None, &[
             DescriptorBinding {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
@@ -363,6 +366,29 @@ impl Scene {
 
         let sampler = TextureSampler::new(device)?;
 
+        let descriptor_layout = DescriptorSetLayout::from_layout_bindings(device, &[
+            LayoutBinding {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                stage: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            },
+            LayoutBinding {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                stage: vk::ShaderStageFlags::FRAGMENT,
+            },
+            LayoutBinding {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                stage: vk::ShaderStageFlags::FRAGMENT,
+            },
+            LayoutBinding {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                stage: vk::ShaderStageFlags::FRAGMENT,
+            },
+            LayoutBinding {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                stage: vk::ShaderStageFlags::FRAGMENT,
+            },
+        ])?;
+
         let materials: Result<Vec<_>> = scene_data.materials
             .iter()
             .enumerate()
@@ -373,48 +399,49 @@ impl Scene {
                 let normal_index = base + 1;
                 let metallic_roughness_index = base + 2;
 
-                let descriptor = DescriptorSet::new(device, &[
-                    DescriptorBinding {
-                        ty: vk::DescriptorType::UNIFORM_BUFFER,
-                        stage: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                        kind: BindingKind::Buffer([
-                            camera_uniforms.view_uniform(0),
-                            camera_uniforms.view_uniform(1),
-                        ]),
-                    },
-                    DescriptorBinding {
-                        ty: vk::DescriptorType::UNIFORM_BUFFER,
-                        stage: vk::ShaderStageFlags::FRAGMENT,
-                        kind: BindingKind::Buffer([
-                            camera_uniforms.proj_uniform(),
-                            camera_uniforms.proj_uniform(),
-                        ]),
-                    },
-                    DescriptorBinding {
-                        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        stage: vk::ShaderStageFlags::FRAGMENT,
-                        kind: BindingKind::Image(&sampler, [
-                            &images[base_color_index],
-                            &images[base_color_index],
-                        ]),
-                    },
-                    DescriptorBinding {
-                        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        stage: vk::ShaderStageFlags::FRAGMENT,
-                        kind: BindingKind::Image(&sampler, [
-                            &images[normal_index],
-                            &images[normal_index],
-                        ]),
-                    },
-                    DescriptorBinding {
-                        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        stage: vk::ShaderStageFlags::FRAGMENT,
-                        kind: BindingKind::Image(&sampler, [
-                            &images[metallic_roughness_index],
-                            &images[metallic_roughness_index],
-                        ]),
-                    },
-                ])?;
+                let descriptor =
+                    DescriptorSet::new_per_frame(device, Some(descriptor_layout.clone()), &[
+                        DescriptorBinding {
+                            ty: vk::DescriptorType::UNIFORM_BUFFER,
+                            stage: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            kind: BindingKind::Buffer([
+                                camera_uniforms.view_uniform(0),
+                                camera_uniforms.view_uniform(1),
+                            ]),
+                        },
+                        DescriptorBinding {
+                            ty: vk::DescriptorType::UNIFORM_BUFFER,
+                            stage: vk::ShaderStageFlags::FRAGMENT,
+                            kind: BindingKind::Buffer([
+                                camera_uniforms.proj_uniform(),
+                                camera_uniforms.proj_uniform(),
+                            ]),
+                        },
+                        DescriptorBinding {
+                            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                            stage: vk::ShaderStageFlags::FRAGMENT,
+                            kind: BindingKind::Image(&sampler, [
+                                &images[base_color_index],
+                                &images[base_color_index],
+                            ]),
+                        },
+                        DescriptorBinding {
+                            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                            stage: vk::ShaderStageFlags::FRAGMENT,
+                            kind: BindingKind::Image(&sampler, [
+                                &images[normal_index],
+                                &images[normal_index],
+                            ]),
+                        },
+                        DescriptorBinding {
+                            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                            stage: vk::ShaderStageFlags::FRAGMENT,
+                            kind: BindingKind::Image(&sampler, [
+                                &images[metallic_roughness_index],
+                                &images[metallic_roughness_index],
+                            ]),
+                        },
+                    ])?;
 
                 Ok(Material {
                     base_color: base_color_index,
@@ -428,29 +455,6 @@ impl Scene {
         let materials = materials?;
 
         let render_pipeline = {
-            // Check that all the materials share the same descriptor set layout.
-            assert!({
-                let mut iter = materials.iter();
-                let first = iter.next();
-
-                iter.fold(first, |acc, mat| {
-                    acc.and_then(|stored| {
-                        if stored.descriptor.layout == mat.descriptor.layout {
-                            Some(stored)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .is_some()
-            });
-
-            let descriptor_layout = materials
-                .first()
-                .unwrap()
-                .descriptor
-                .layout;
-
             let vertex_code = include_bytes_aligned_as!(u32, "../shaders/vert.spv");
             let fragment_code = include_bytes_aligned_as!(u32, "../shaders/frag.spv");
 
@@ -462,18 +466,19 @@ impl Scene {
                 .depth_write_enable(true)
                 .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
 
-            let pipeline = Pipeline::new(device, PipelineRequest::Render {
-                descriptor_layouts: &[
-                    descriptor_layout,
-                    light_descriptor.layout,
-                ],
-                push_constants: &[
-                    vk::PushConstantRange::builder()
-                        .stage_flags(vk::ShaderStageFlags::VERTEX)
-                        .size(mem::size_of::<ModelTransform>() as u32)
-                        .offset(0)
-                        .build(),
-                ],
+            let push_consts = [vk::PushConstantRange::builder()
+                .stage_flags(vk::ShaderStageFlags::VERTEX)
+                .size(mem::size_of::<ModelTransform>() as u32)
+                .offset(0)
+                .build()];
+
+            let layout = PipelineLayout::new(device, &push_consts, &[
+                descriptor_layout.clone(),
+                light_descriptor.layout.clone(),
+            ])?;
+
+            let pipeline = GraphicsPipeline::new(device, GraphicsPipelineReq {
+                layout,
                 vertex_attributes: &[
                     vk::VertexInputAttributeDescription {
                         format: vk::Format::R32G32B32_SFLOAT,
@@ -518,21 +523,14 @@ impl Scene {
 
         let materials = Materials { images, sampler, materials };
 
-        Ok(Self {
-            lights,
-            light_descriptor,
-            render_pipeline,
-            buffers,
-            models,
-            materials,
-        })
+        Ok(Self { lights, light_descriptor, render_pipeline, buffers, models, materials })
     }
 
-    pub fn vertex_buffer(&mut self) -> &Buffer {
+    pub fn vertex_buffer(&self) -> &Buffer {
         &self.buffers[0]
     }
 
-    pub fn index_buffer(&mut self) -> &Buffer {
+    pub fn index_buffer(&self) -> &Buffer {
         &self.buffers[1]
     }
 
