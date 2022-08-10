@@ -4,26 +4,13 @@ use ash::vk;
 
 use std::mem;
 use std::ops::Index;
+use std::rc::Rc;
 
-use crate::Camera;
-use crate::light::{PointLight, Lights};
-use crate::core::{
-    Device,
-    Swapchain,
-    RenderPass,
-    RenderTargets,
-    GraphicsPipeline,
-    GraphicsPipelineReq,
-    PipelineLayout,
-    ShaderModule,
-    DescriptorSet,
-    LayoutBinding,
-    DescriptorSetLayout,
-    DescriptorBinding,
-    BindingKind,
-};
+use crate::light::Lights;
+use crate::core::*;
+use crate::handle::Handle;
 use crate::camera::CameraUniforms;
-use crate::resource::{self, Buffer, Image, MappedMemory, TextureSampler};
+use crate::resource::{self, Buffer, Image, ImageReq, MappedMemory, TextureSampler};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -68,8 +55,8 @@ pub struct Material {
 }
 
 pub struct Materials {
-    pub images: Vec<Image>, 
-    pub sampler: TextureSampler,
+    pub images: Vec<Rc<Image>>, 
+    pub sampler: Handle<TextureSampler>,
     materials: Vec<Material>,
 }
 
@@ -82,50 +69,20 @@ impl Index<usize> for Materials {
 }
 
 pub struct Scene {
-    pub lights: Lights,
     pub render_pipeline: GraphicsPipeline,
     pub light_descriptor: DescriptorSet,
     pub materials: Materials,
     pub models: Vec<Model>,
-    pub buffers: Vec<Buffer>,
+    pub buffers: Vec<Rc<Buffer>>,
 }
 
 impl Scene {
     pub fn from_scene_data(
-        device: &Device,
-        swapchain: &Swapchain,
-        render_pass: &RenderPass,
-        render_targets: &RenderTargets,
+        renderer: &Renderer,
         camera_uniforms: &CameraUniforms,
-        camera: &Camera,
+        lights: &Lights,
         scene_data: &SceneData,
     ) -> Result<Self> {
-        let mut lights = Vec::default();
-
-        for i in 0..20 {
-            let red = (i % 2) as f32;
-            let blue = ((i + 1) % 2) as f32;
-
-            let start = Vec3::new(-16.0, -3.0, -8.0);
-            let end = Vec3::new(15.0, 13.0, 8.0);
-
-            let position = start.lerp(end, i as f32 / 20.0);
-
-            lights.push(PointLight::new(
-                position,
-                Vec3::new(red, 1.0, blue) * 6.0,
-                8.0,
-            ));
-        }
-
-        let lights = Lights::new(
-            device,
-            &camera_uniforms,
-            &camera,
-            &swapchain,
-            &lights,
-        )?;
-
         let staging = {
             let create_infos = [
                 vk::BufferCreateInfo::builder()
@@ -143,8 +100,14 @@ impl Scene {
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-            let (buffers, block) = resource::create_buffers(device, &create_infos, memory_flags, 4)?;
-            let mapped = MappedMemory::new(&block)?;
+            let (buffers, block) = resource::create_buffers(
+                &renderer,
+                &create_infos,
+                memory_flags,
+                4,
+            )?;
+
+            let mapped = MappedMemory::new(block.clone())?;
 
             [scene_data.vertex_data.as_slice(), scene_data.index_data.as_slice()]
                 .iter()
@@ -176,7 +139,7 @@ impl Scene {
             ];
 
             let (buffers, _) = resource::create_buffers(
-                device,
+                &renderer,
                 &create_infos,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 4,
@@ -185,7 +148,7 @@ impl Scene {
             buffers
         };
 
-        device.transfer_with(|recorder| {
+        renderer.device.transfer_with(|recorder| {
             for (src, dst) in staging.iter().zip(buffers.iter()) {
                 recorder.copy_buffers(src, dst);
             }
@@ -216,8 +179,14 @@ impl Scene {
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-            let (staging, block) = resource::create_buffers(device, &create_infos, memory_flags, 4)?;
-            let mapped = MappedMemory::new(&block)?;
+            let (staging, block) = resource::create_buffers(
+                &renderer,
+                &create_infos,
+                memory_flags,
+                4,
+            )?;
+
+            let mapped = MappedMemory::new(block.clone())?;
            
             scene_data.materials
                 .iter()
@@ -235,77 +204,52 @@ impl Scene {
         };
 
         let mut images = {
-            let image_infos: Vec<_> = scene_data.materials
+            let image_reqs: Vec<_> = scene_data.materials
                 .iter()
-                .flat_map(|mat| {
-                    fn image_info(
-                        image_data: &ImageData,
-                        format: vk::Format,
-                    ) -> vk::ImageCreateInfo {
-                        vk::ImageCreateInfo::builder()
-                            .image_type(vk::ImageType::TYPE_2D)
-                            .usage(
-                                vk::ImageUsageFlags::TRANSFER_DST
-                                    | vk::ImageUsageFlags::SAMPLED
-                            )
-                            .format(format)
-                            .tiling(vk::ImageTiling::OPTIMAL)
-                            .initial_layout(vk::ImageLayout::UNDEFINED)
-                            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                            .extent(vk::Extent3D {
-                                width: image_data.width,
-                                height: image_data.height,
-                                depth: 1,
-                            })
-                            .mip_levels(1)
-                            .array_layers(1)
-                            .samples(vk::SampleCountFlags::TYPE_1)
-                            .build()
-                    }
-                    [
-                        image_info(&mat.base_color, vk::Format::R8G8B8A8_SRGB),
-                        image_info(&mat.normal, vk::Format::R8G8B8A8_UNORM),
-                        image_info(&mat.metallic_roughness, vk::Format::R8G8_SRGB),
-                    ]
-                })
-                .collect();
-
-            let view_infos: Vec<_> = scene_data.materials
-                .iter()
-                .flat_map(|_| {
-                    fn view_info(format: vk::Format) -> vk::ImageViewCreateInfo {
-                        let subresource_range = vk::ImageSubresourceRange::builder()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(1)
-                            .base_array_layer(0)
-                            .layer_count(1)
-                            .build();
-                        vk::ImageViewCreateInfo::builder()
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .subresource_range(subresource_range)
-                            .format(format)
-                            .build()
-                    }
-                    [
-                        view_info(vk::Format::R8G8B8A8_SRGB),
-                        view_info(vk::Format::R8G8B8A8_UNORM),
-                        view_info(vk::Format::R8G8_SRGB),
-                    ]
-                })
+                .flat_map(|mat| [
+                    ImageReq {
+                        format: vk::Format::R8G8B8A8_SRGB,
+                        usage: vk::ImageUsageFlags::TRANSFER_DST
+                            | vk::ImageUsageFlags::SAMPLED,
+                        extent: vk::Extent3D {
+                            width: mat.base_color.width,
+                            height: mat.base_color.height,
+                            depth: 1,
+                        },
+                    },
+                    ImageReq {
+                        format: vk::Format::R8G8B8A8_UNORM,
+                        usage: vk::ImageUsageFlags::TRANSFER_DST
+                            | vk::ImageUsageFlags::SAMPLED,
+                        extent: vk::Extent3D {
+                            width: mat.normal.width,
+                            height: mat.normal.height,
+                            depth: 1,
+                        },
+                    },
+                    ImageReq {
+                        format: vk::Format::R8G8_SRGB,
+                        usage: vk::ImageUsageFlags::TRANSFER_DST
+                            | vk::ImageUsageFlags::SAMPLED,
+                        extent: vk::Extent3D {
+                            width: mat.metallic_roughness.width,
+                            height: mat.metallic_roughness.height,
+                            depth: 1,
+                        },
+                    },
+                ])
                 .collect();
 
             let (images, _) = resource::create_images(
-                device,
-                &image_infos,
-                &view_infos,
+                &renderer,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                &image_reqs,
             )?;
 
             images
         };
 
-        device.transfer_with(|recorder| {
+        renderer.device.transfer_with(|recorder| {
             for image in images.iter_mut() {
                 recorder.transition_image_layout(image, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
             }
@@ -337,36 +281,39 @@ impl Scene {
             })
             .collect();
 
-        let light_descriptor = DescriptorSet::new_per_frame(device, None, &[
-            DescriptorBinding {
+        let layout = DescriptorSetLayout::new(&renderer, &[
+            LayoutBinding {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
-                kind: BindingKind::Buffer([
-                    &lights.cluster_info.buffer, 
-                    &lights.cluster_info.buffer, 
-                ]),
             },
-            DescriptorBinding {
+            LayoutBinding {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
-                kind: BindingKind::Buffer([
-                    lights.light_buffer(), 
-                    lights.light_buffer(), 
-                ]),
             },
-            DescriptorBinding {
+            LayoutBinding {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
-                kind: BindingKind::Buffer([
-                    lights.light_mask_buffer(0), 
-                    lights.light_mask_buffer(1), 
-                ]),
             },
         ])?;
 
-        let sampler = TextureSampler::new(device)?;
+        let light_descriptor = DescriptorSet::new_per_frame(&renderer, layout, &[
+            DescriptorBinding::Buffer([
+                lights.cluster_info.buffer.clone(), 
+                lights.cluster_info.buffer.clone(), 
+            ]),
+            DescriptorBinding::Buffer([
+                lights.light_buffer().clone(), 
+                lights.light_buffer().clone(), 
+            ]),
+            DescriptorBinding::Buffer([
+                lights.light_mask_buffer(0).clone(), 
+                lights.light_mask_buffer(1).clone(), 
+            ]),
+        ])?;
 
-        let descriptor_layout = DescriptorSetLayout::from_layout_bindings(device, &[
+        let sampler = TextureSampler::new(&renderer)?;
+
+        let descriptor_layout = DescriptorSetLayout::new(&renderer, &[
             LayoutBinding {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
                 stage: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
@@ -399,49 +346,28 @@ impl Scene {
                 let normal_index = base + 1;
                 let metallic_roughness_index = base + 2;
 
-                let descriptor =
-                    DescriptorSet::new_per_frame(device, Some(descriptor_layout.clone()), &[
-                        DescriptorBinding {
-                            ty: vk::DescriptorType::UNIFORM_BUFFER,
-                            stage: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                            kind: BindingKind::Buffer([
-                                camera_uniforms.view_uniform(0),
-                                camera_uniforms.view_uniform(1),
-                            ]),
-                        },
-                        DescriptorBinding {
-                            ty: vk::DescriptorType::UNIFORM_BUFFER,
-                            stage: vk::ShaderStageFlags::FRAGMENT,
-                            kind: BindingKind::Buffer([
-                                camera_uniforms.proj_uniform(),
-                                camera_uniforms.proj_uniform(),
-                            ]),
-                        },
-                        DescriptorBinding {
-                            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            stage: vk::ShaderStageFlags::FRAGMENT,
-                            kind: BindingKind::Image(&sampler, [
-                                &images[base_color_index],
-                                &images[base_color_index],
-                            ]),
-                        },
-                        DescriptorBinding {
-                            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            stage: vk::ShaderStageFlags::FRAGMENT,
-                            kind: BindingKind::Image(&sampler, [
-                                &images[normal_index],
-                                &images[normal_index],
-                            ]),
-                        },
-                        DescriptorBinding {
-                            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            stage: vk::ShaderStageFlags::FRAGMENT,
-                            kind: BindingKind::Image(&sampler, [
-                                &images[metallic_roughness_index],
-                                &images[metallic_roughness_index],
-                            ]),
-                        },
-                    ])?;
+                let descriptor = DescriptorSet::new_per_frame(&renderer, descriptor_layout.clone(), &[
+                    DescriptorBinding::Buffer([
+                        camera_uniforms.view_uniform(0).clone(),
+                        camera_uniforms.view_uniform(1).clone(),
+                    ]),
+                    DescriptorBinding::Buffer([
+                        camera_uniforms.proj_uniform().clone(),
+                        camera_uniforms.proj_uniform().clone(),
+                    ]),
+                    DescriptorBinding::Image(sampler.clone(), [
+                        images[base_color_index].clone(),
+                        images[base_color_index].clone(),
+                    ]),
+                    DescriptorBinding::Image(sampler.clone(), [
+                        images[normal_index].clone(),
+                        images[normal_index].clone(),
+                    ]),
+                    DescriptorBinding::Image(sampler.clone(), [
+                        images[metallic_roughness_index].clone(),
+                        images[metallic_roughness_index].clone(),
+                    ]),
+                ])?;
 
                 Ok(Material {
                     base_color: base_color_index,
@@ -458,8 +384,8 @@ impl Scene {
             let vertex_code = include_bytes_aligned_as!(u32, "../shaders/vert.spv");
             let fragment_code = include_bytes_aligned_as!(u32, "../shaders/frag.spv");
 
-            let vertex_module = ShaderModule::new(&device, "main", vertex_code)?;
-            let fragment_module = ShaderModule::new(&device, "main", fragment_code)?;
+            let vertex_module = ShaderModule::new(&renderer, "main", vertex_code)?;
+            let fragment_module = ShaderModule::new(&renderer, "main", fragment_code)?;
 
             let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::builder()
                 .depth_test_enable(true)
@@ -472,12 +398,12 @@ impl Scene {
                 .offset(0)
                 .build()];
 
-            let layout = PipelineLayout::new(device, &push_consts, &[
+            let layout = PipelineLayout::new(&renderer, &push_consts, &[
                 descriptor_layout.clone(),
                 light_descriptor.layout.clone(),
             ])?;
 
-            let pipeline = GraphicsPipeline::new(device, GraphicsPipelineReq {
+            let pipeline = GraphicsPipeline::new(&renderer, GraphicsPipelineReq {
                 layout,
                 vertex_attributes: &[
                     vk::VertexInputAttributeDescription {
@@ -513,9 +439,6 @@ impl Scene {
                 depth_stencil_info: &depth_stencil_info,
                 vertex_shader: &vertex_module,
                 fragment_shader: &fragment_module,
-                swapchain,
-                render_pass,
-                render_targets,
             })?;
 
             pipeline
@@ -523,7 +446,7 @@ impl Scene {
 
         let materials = Materials { images, sampler, materials };
 
-        Ok(Self { lights, light_descriptor, render_pipeline, buffers, models, materials })
+        Ok(Self { light_descriptor, render_pipeline, buffers, models, materials })
     }
 
     pub fn vertex_buffer(&self) -> &Buffer {
@@ -532,15 +455,6 @@ impl Scene {
 
     pub fn index_buffer(&self) -> &Buffer {
         &self.buffers[1]
-    }
-
-    pub fn handle_resize(
-        &mut self,
-        device: &Device,
-        camera: &Camera,
-        swapchain: &Swapchain,
-    ) -> Result<()> {
-        self.lights.handle_resize(device, camera, swapchain)
     }
 }
 

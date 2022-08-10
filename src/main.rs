@@ -14,7 +14,7 @@ mod core;
 mod scene;
 mod light;
 mod text;
-mod shared;
+mod handle;
 mod camera;
 
 mod gltf_import;
@@ -31,6 +31,7 @@ use std::path::Path;
 use crate::core::Renderer;
 use crate::text::TextPass;
 use crate::scene::Scene;
+use crate::light::{Lights, PointLight};
 use crate::camera::{Camera, CameraUniforms};
 
 fn main() -> Result<()> {
@@ -55,32 +56,16 @@ fn main() -> Result<()> {
 
     let font = font_import::FontData::new(Path::new("fonts/source_code_pro/metadata.json"))?;
 
-    let mut text_pass = TextPass::new(
-        &renderer.device,
-        &renderer.swapchain,
-        &renderer.render_pass,
-        &renderer.render_targets,
-        &font,
-    )?;
+    let mut text_pass = TextPass::new(&renderer, &font)?;
 
     let mut camera = Camera::new(renderer.swapchain.aspect_ratio());
-    let camera_uniforms = CameraUniforms::new(
-        &renderer.device,
-        &camera,
-        &renderer.swapchain,
-    )?;
+    let camera_uniforms = CameraUniforms::new(&renderer, &camera)?;
+
+    let lights = debug_lights();
+    let mut lights = Lights::new(&renderer, &camera_uniforms, &camera, &lights)?;
 
     let scene_data = gltf_import::load(Path::new("models/sponza/Sponza.gltf"))?;
-
-    let mut scene = Scene::from_scene_data(
-        &renderer.device,
-        &renderer.swapchain,
-        &renderer.render_pass,
-        &renderer.render_targets,
-        &camera_uniforms,
-        &camera,
-        &scene_data,
-    )?;
+    let scene = Scene::from_scene_data(&renderer, &camera_uniforms, &lights, &scene_data)?;
 
     event_loop.run(move |event, _, controlflow| match event {
         Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
@@ -103,11 +88,10 @@ fn main() -> Result<()> {
             } else {
                 minimized = false;
                 renderer.resize(&window).expect("failed to resize window");
-                text_pass.handle_resize(&renderer.swapchain);
+                text_pass.handle_resize(&renderer);
                 camera.update_proj(renderer.swapchain.aspect_ratio());
-                camera_uniforms.update_proj(&camera, &renderer.swapchain);
-                scene.handle_resize(&renderer.device, &camera, &renderer.swapchain)
-                    .expect("failed to resize scene");
+                camera_uniforms.update_proj(&renderer, &camera);
+                lights.handle_resize(&renderer, &camera).expect("failed to resize lights");
             }
         }
         Event::RedrawRequested(_) => {
@@ -118,8 +102,6 @@ fn main() -> Result<()> {
                 let res = renderer.draw(
                     |recorder| {
                         camera_uniforms.update_view(recorder.frame_index(), &camera);
-
-                        let lights = &scene.lights;
 
                         recorder.bind_descriptor_sets(
                             vk::PipelineBindPoint::COMPUTE,
@@ -254,4 +236,26 @@ impl InputState {
     pub fn mouse_delta(&mut self) -> (f64, f64) {
         self.mouse_delta.take().unwrap_or((0.0, 0.0))
     }
+}
+
+fn debug_lights() -> Vec<PointLight> {
+    let mut lights = Vec::default();
+
+    for i in 0..20 {
+        let red = (i % 2) as f32;
+        let blue = ((i + 1) % 2) as f32;
+
+        let start = Vec3::new(-16.0, -3.0, -8.0);
+        let end = Vec3::new(15.0, 13.0, 8.0);
+
+        let position = start.lerp(end, i as f32 / 20.0);
+
+        lights.push(PointLight::new(
+            position,
+            Vec3::new(red, 1.0, blue) * 6.0,
+            8.0,
+        ));
+    }
+
+    lights 
 }

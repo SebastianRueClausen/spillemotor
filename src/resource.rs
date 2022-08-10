@@ -4,25 +4,27 @@ use ash::vk;
 
 use std::{ops, slice};
 use std::rc::Rc;
+use std::cell::Cell;
 
-use crate::core::Device;
+use crate::core::{Renderer, Device};
+use crate::handle::Handle;
 
 type MemoryRange = ops::Range<vk::DeviceSize>;
 
 /// A wrapper around a raw ptr into a mapped memory block.
 pub struct MappedMemory {
     ptr: *mut u8,
-    block: MemoryBlock,
+    block: Handle<MemoryBlock>,
 }
 
 impl MappedMemory {
-    pub fn new(block: &MemoryBlock) -> Result<Self> {
+    pub fn new(block: Handle<MemoryBlock>) -> Result<Self> {
         let ptr = unsafe {
             block.device.handle
                 .map_memory(block.handle, 0, block.size, vk::MemoryMapFlags::empty())
                 .map(|ptr| ptr as *mut u8)?
         };
-        Ok(Self { ptr, block: block.clone() })
+        Ok(Self { ptr, block })
     }
 
     unsafe fn get_range_unchecked(&self, range: MemoryRange) -> &mut [u8] {
@@ -38,7 +40,7 @@ impl MappedMemory {
     /// This will panic if the underlying memory block of the buffer isn't the same as the
     /// underlying block of `self`.
     pub fn get_buffer_data(&self, buffer: &Buffer) -> &mut [u8] {
-        if buffer.block != self.block {
+        if *buffer.block != *self.block {
             panic!("block of buffer isn't same as mapped memory");
         }
         // Safety: At this point we know that the buffer uses the same memory block, and the buffer
@@ -48,7 +50,8 @@ impl MappedMemory {
 }
 
 /// A block of raw device memory.
-pub struct MemoryBlockShared {
+#[derive(Clone)]
+pub struct MemoryBlock {
     handle: vk::DeviceMemory,
 
     #[allow(dead_code)]
@@ -59,21 +62,15 @@ pub struct MemoryBlockShared {
     device: Device,
 }
 
-impl MemoryBlockShared {
+impl MemoryBlock {
     fn new(
         device: &Device,
         properties: vk::MemoryPropertyFlags,
         info: &vk::MemoryAllocateInfo,
-    ) -> Result<Self> {
+    ) -> Result<Handle<Self>> {
         let handle = unsafe { device.handle.allocate_memory(info, None)? };
         let size = info.allocation_size;
-
-        Ok(Self {
-            device: device.clone(),
-            handle,
-            properties,
-            size,
-        })
+        Ok(Handle::new(Self { device: device.clone(), handle, properties, size }))
     }
 
     #[allow(dead_code)]
@@ -82,59 +79,35 @@ impl MemoryBlockShared {
     }
 }
 
-impl Drop for MemoryBlockShared {
+impl Drop for MemoryBlock {
     fn drop(&mut self) {
         unsafe { self.device.handle.free_memory(self.handle, None); }
     }
 }
 
-#[derive(Clone)]
-pub struct MemoryBlock {
-    shared: Rc<MemoryBlockShared>, 
-}
-
-impl ops::Deref for MemoryBlock {
-    type Target = MemoryBlockShared;
-
-    fn deref(&self) -> &Self::Target {
-        &self.shared
-    }
-}
-
 impl PartialEq for MemoryBlock {
     fn eq(&self, other: &Self) -> bool {
-        Rc::<MemoryBlockShared>::as_ptr(&self.shared)
-            == Rc::<MemoryBlockShared>::as_ptr(&other.shared)
+        self.handle == other.handle
     }
 }
 
 impl Eq for MemoryBlock {}
 
-impl MemoryBlock {
-    fn new(
-        device: &Device,
-        properties: vk::MemoryPropertyFlags,
-        info: &vk::MemoryAllocateInfo,
-    ) -> Result<Self> {
-        Ok(Self {
-            shared: Rc::new(MemoryBlockShared::new(device, properties, info)?)
-        })
-    }
-}
-
 #[derive(Clone)]
 pub struct Buffer {
     pub handle: vk::Buffer,
-    pub block: MemoryBlock,
+    pub block: Handle<MemoryBlock>,
     pub range: MemoryRange,
 }
 
 impl Buffer {
     pub fn new(
-        device: &Device,
+        renderer: &Renderer,
         info: &vk::BufferCreateInfo,
         memory_flags: vk::MemoryPropertyFlags,
-    ) -> Result<Self> {
+    ) -> Result<Rc<Self>> {
+        let device = renderer.device.clone();
+
         let handle = unsafe { device.handle.create_buffer(info, None)? };
         let req = unsafe { device.handle.get_buffer_memory_requirements(handle) };
 
@@ -157,10 +130,10 @@ impl Buffer {
             alloc_info = alloc_info.push_next(&mut alloc_flags);
         }
 
-        let block = MemoryBlock::new(device, memory_flags, &alloc_info)?;
+        let block = MemoryBlock::new(&device, memory_flags, &alloc_info)?;
         unsafe { device.handle.bind_buffer_memory(handle, block.handle, 0)?; }
 
-        Ok(Self { handle, range: 0..block.size, block })
+        Ok(Rc::new(Self { handle, range: 0..block.size, block }))
     }
 
     pub fn size(&self) -> vk::DeviceSize {
@@ -175,11 +148,13 @@ impl Drop for Buffer {
 }
 
 pub fn create_buffers(
-    device: &Device,
+    renderer: &Renderer,
     create_infos: &[vk::BufferCreateInfo],
     memory_flags: vk::MemoryPropertyFlags,
     alignment: vk::DeviceSize,
-) -> Result<(Vec<Buffer>, MemoryBlock)> {
+) -> Result<(Vec<Rc<Buffer>>, Handle<MemoryBlock>)> {
+    let device = renderer.device.clone();
+
     let mut memory_type_bits = u32::MAX;
     let mut current_size = 0;
 
@@ -227,15 +202,15 @@ pub fn create_buffers(
         alloc_info = alloc_info.push_next(&mut flags)
     }
 
-    let block = MemoryBlock::new(device, memory_flags, &alloc_info)?;
+    let block = MemoryBlock::new(&device, memory_flags, &alloc_info)?;
 
     let buffers: Vec<_> = buffers
         .into_iter()
-        .map(|(handle, range)| Buffer {
+        .map(|(handle, range)| Rc::new(Buffer {
             block: block.clone(),
             handle,
             range,
-        })
+        }))
         .collect();
 
     for buffer in &buffers {
@@ -247,25 +222,58 @@ pub fn create_buffers(
     Ok((buffers, block))
 }
 
-/// A single image and image view which doesn't own it's own memory.
-///
-/// This doesn't own it's own memory device memory, and has therefore implicitly the lifetime of
-/// the owning [`Images`] or the [`MemoryBlock`] where the memory is allocated.
-///
-/// # Safety
-///
-/// Don't use the buffer after destroying the owning [`Images`] object or deallocating the
-/// [`MemoryBlock`].
+#[derive(Clone, Copy)]
+pub struct ImageReq {
+    pub usage: vk::ImageUsageFlags,
+    pub format: vk::Format,
+    pub extent: vk::Extent3D,
+}
+
+impl Into<vk::ImageCreateInfo> for ImageReq {
+    fn into(self) -> vk::ImageCreateInfo {
+        vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .format(self.format)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .extent(self.extent)
+            .mip_levels(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .array_layers(1)
+            .build()
+    }
+}
+
+impl Into<vk::ImageViewCreateInfo> for ImageReq {
+    fn into(self) -> vk::ImageViewCreateInfo {
+        let subresource_range = vk::ImageSubresourceRange::builder()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        vk::ImageViewCreateInfo::builder()
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .subresource_range(*subresource_range)
+            .format(self.format)
+            .build()
+    }
+}
+
 #[derive(Clone)]
 pub struct Image {
     pub handle: vk::Image,
     pub view: vk::ImageView,
-    pub layout: vk::ImageLayout,
-    pub format: vk::Format,
     pub extent: vk::Extent3D,
+    pub format: vk::Format,
+
+    /// Layout is mutable.
+    pub layout: Cell<vk::ImageLayout>,
 
     pub range: MemoryRange,
-    pub block: MemoryBlock,
+    pub block: Handle<MemoryBlock>,
 }
 
 impl Image {
@@ -275,11 +283,27 @@ impl Image {
     }
 
     pub fn new(
-        device: &Device,
-        image_info: vk::ImageCreateInfo,
-        mut view_info: vk::ImageViewCreateInfo,
+        renderer: &Renderer,
         memory_flags: vk::MemoryPropertyFlags,
-    ) -> Result<Self> {
+        req: ImageReq,
+    ) -> Result<Rc<Self>> {
+        Self::from_raw(&renderer.device, memory_flags, &req, &req)
+    }
+
+    pub fn from_raw<I, V>(
+        device: &Device,
+        memory_flags: vk::MemoryPropertyFlags,
+        image_info: &I,
+        view_info: &V,
+    ) -> Result<Rc<Self>>
+    where
+        I: Into<vk::ImageCreateInfo> + Clone + Copy,
+        V: Into<vk::ImageViewCreateInfo> + Clone + Copy,
+    {
+        let device = device.clone();
+
+        let image_info: vk::ImageCreateInfo = (*image_info).into();
+
         let handle = unsafe { device.handle.create_image(&image_info, None)? };
         let requirements = unsafe { device.handle.get_image_memory_requirements(handle) };
 
@@ -295,25 +319,29 @@ impl Image {
             let alloc_info = vk::MemoryAllocateInfo::builder()
                 .allocation_size(requirements.size)
                 .memory_type_index(memory_type);
-            MemoryBlock::new(device, memory_flags, &alloc_info)?
+            MemoryBlock::new(&device, memory_flags, &alloc_info)?
         };
 
         unsafe { device.handle.bind_image_memory(handle, block.handle, 0)?; }
+        
+        let mut view_info: vk::ImageViewCreateInfo = (*view_info).into();
+        view_info.image = handle;
 
-        let view = unsafe {
-            view_info.image = handle;
-            device.handle.create_image_view(&view_info, None)?
-        };
+        let view = unsafe { device.handle.create_image_view(&view_info, None)? };
 
-        Ok(Image {
-            layout: image_info.initial_layout,
+        Ok(Rc::new(Image {
+            layout: Cell::new(image_info.initial_layout),
             extent: image_info.extent,
             format: image_info.format,
             range: 0..requirements.size,
             handle,
             view,
             block,
-        })
+        }))
+    }
+
+    pub fn layout(&self) -> vk::ImageLayout {
+        self.layout.get()
     }
 }
 
@@ -327,16 +355,24 @@ impl Drop for Image {
 }
 
 pub fn create_images(
-    device: &Device,
-    image_infos: &[vk::ImageCreateInfo],
-    view_infos: &[vk::ImageViewCreateInfo],
+    renderer: &Renderer,
     memory_flags: vk::MemoryPropertyFlags,
-) -> Result<(Vec<Image>, MemoryBlock)> {
-    assert_eq!(
-        image_infos.len(),
-        view_infos.len(),
-        "`image_infos` and `view_infos` are not same length"
-    );
+    reqs: &[ImageReq],
+) -> Result<(Vec<Rc<Image>>, Handle<MemoryBlock>)> {
+    create_images_raw(&renderer.device, memory_flags, reqs, reqs)
+}
+
+pub fn create_images_raw<I, V>(
+    device: &Device,
+    memory_flags: vk::MemoryPropertyFlags,
+    image_infos: &[I],
+    view_infos: &[V],
+) -> Result<(Vec<Rc<Image>>, Handle<MemoryBlock>)>
+where
+    I: Into<vk::ImageCreateInfo> + Clone + Copy,
+    V: Into<vk::ImageViewCreateInfo> + Clone + Copy,
+{
+    let device = device.clone();
 
     let mut memory_type_bits = u32::MAX;
     let mut current_size = 0;
@@ -351,14 +387,10 @@ pub fn create_images(
 
     let images: Result<SmallVec<[_; 8]>> = image_infos
         .iter()
-        .zip(view_infos.iter())
-        .map(|(image_info, view_info)| {
-            assert_eq!(
-                view_info.format, image_info.format,
-                "image format and view format not the same",
-            );
+        .map(|info| {
+            let image_info: vk::ImageCreateInfo = (*info).into();
 
-            let handle = unsafe { device.handle.create_image(image_info, None)? };
+            let handle = unsafe { device.handle.create_image(&image_info, None)? };
             let requirements = unsafe { device.handle.get_image_memory_requirements(handle) };
 
             let start = align_up_to(current_size, requirements.alignment);
@@ -387,45 +419,45 @@ pub fn create_images(
         let alloc_info = vk::MemoryAllocateInfo::builder()
             .allocation_size(current_size)
             .memory_type_index(memory_type);
-        MemoryBlock::new(device, memory_flags, &alloc_info)?
+        MemoryBlock::new(&device, memory_flags, &alloc_info)?
     };
 
     let images: Result<Vec<_>> = images
         .iter_mut()
         .zip(view_infos.iter())
-        .map(|(image, view_info)| unsafe {
+        .map(|(image, info)| unsafe {
             device.handle.bind_image_memory(image.handle, block.handle, image.range.start)?;  
 
-            let mut info = view_info.clone();
+            let mut info: vk::ImageViewCreateInfo = (*info).into();
             info.image = image.handle;
 
             let view = device.handle.create_image_view(&info, None)?;
 
-            Ok(Image {
+            Ok(Rc::new(Image {
                 handle: image.handle,
-                layout: image.layout,
+                layout: Cell::new(image.layout),
                 format: image.format,
                 extent: image.extent,
                 range: image.range.clone(),
                 block: block.clone(),
                 view,
-            })
+            }))
         })
         .collect();
 
-    Ok((images?, block.clone()))
+    Ok((images?, block))
 }
 
+#[derive(Clone)]
 pub struct TextureSampler {
     pub handle: vk::Sampler,
     device: Device,
 }
 
 impl TextureSampler {
-    pub fn new(device: &Device) -> Result<Self> {
-        let create_info = vk::SamplerCreateInfo::builder()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
+    pub fn new(renderer: &Renderer) -> Result<Handle<Self>> {
+        let device = renderer.device.clone(); 
+        let create_info = vk::SamplerCreateInfo::builder() .mag_filter(vk::Filter::LINEAR) .min_filter(vk::Filter::LINEAR)
             .address_mode_u(vk::SamplerAddressMode::REPEAT)
             .address_mode_v(vk::SamplerAddressMode::REPEAT)
             .address_mode_w(vk::SamplerAddressMode::REPEAT)
@@ -440,15 +472,13 @@ impl TextureSampler {
             .min_lod(0.0)
             .max_lod(0.0);
         let handle = unsafe { device.handle.create_sampler(&create_info, None)? };
-        Ok(Self { handle, device: device.clone() })
+        Ok(Handle::new(Self { handle, device }))
     }
 }
 
 impl Drop for TextureSampler {
     fn drop(&mut self) {
-        unsafe {
-            self.device.handle.destroy_sampler(self.handle, None);
-        }
+        unsafe { self.device.handle.destroy_sampler(self.handle, None); }
     }
 }
 

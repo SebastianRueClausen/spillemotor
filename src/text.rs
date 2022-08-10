@@ -5,24 +5,11 @@ use smallvec::SmallVec;
 use nohash_hasher::NoHashHasher;
 
 use std::{mem, iter, hash};
+use std::rc::Rc;
 use std::collections::HashMap;
 
-use crate::core::{
-    BindingKind,
-    DescriptorBinding,
-    DescriptorSet,
-    Device,
-    FRAMES_IN_FLIGHT,
-    GraphicsPipeline,
-    GraphicsPipelineReq,
-    CommandRecorder,
-    PipelineLayout,
-    RenderPass,
-    RenderTargets,
-    ShaderModule,
-    Swapchain,
-};
-use crate::resource::{self, Buffer, Image, MappedMemory, TextureSampler};
+use crate::core::*;
+use crate::resource::{self, Buffer, Image, ImageReq, MappedMemory, TextureSampler};
 use crate::font_import::{FontData, Glyph};
 
 #[repr(C)]
@@ -48,17 +35,9 @@ pub struct TextPass {
     /// | 0     | index  |
     /// | 1     | index  |
     ///
-    buffers: Vec<Buffer>,
+    buffers: Vec<Rc<Buffer>>,
 
     mapped: MappedMemory,
-
-    /// Sampler to sample the glyph atlas.
-    #[allow(dead_code)]
-    sampler: TextureSampler,
-
-    /// Just a single image used to store the glyph atlas.
-    #[allow(dead_code)]
-    glyph_atlas: Image,
 
     /// The projection matrix used for rendering text.
     ///
@@ -69,13 +48,7 @@ pub struct TextPass {
 }
 
 impl TextPass {
-    pub fn new(
-        device: &Device,
-        swapchain: &Swapchain,
-        render_pass: &RenderPass,
-        render_targets: &RenderTargets,
-        font: &FontData,
-    ) -> Result<Self> {
+    pub fn new(renderer: &Renderer, font: &FontData) -> Result<Self> {
         let text_objects = TextObjects::new(FontAtlas::new(font));
 
         let (buffers, block) = {
@@ -95,10 +68,10 @@ impl TextPass {
                 .collect();
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            resource::create_buffers(device, &infos, memory_flags, 4)?
+            resource::create_buffers(&renderer, &infos, memory_flags, 4)?
         };
 
-        let mapped = MappedMemory::new(&block)?;
+        let mapped = MappedMemory::new(block.clone())?;
 
         let staging = {
             let create_info = vk::BufferCreateInfo::builder()
@@ -109,8 +82,8 @@ impl TextPass {
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-            let staging = Buffer::new(device, &create_info, memory_flags)?;
-            let mapped = MappedMemory::new(&staging.block)?;
+            let staging = Buffer::new(&renderer, &create_info, memory_flags)?;
+            let mapped = MappedMemory::new(staging.block.clone())?;
 
             mapped.get_buffer_data(&staging).copy_from_slice(font.atlas.as_slice());
 
@@ -123,45 +96,33 @@ impl TextPass {
             depth: 1,
         };
 
-        let sampler = TextureSampler::new(device)?;
+        let sampler = TextureSampler::new(&renderer)?;
     
         let mut glyph_atlas = {
-            let image_info = vk::ImageCreateInfo::builder()
-                .image_type(vk::ImageType::TYPE_2D)
-                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-                .format(vk::Format::R8_UNORM)
-                .tiling(vk::ImageTiling::OPTIMAL)
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .extent(extent)
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1);
-            let subresource_range = vk::ImageSubresourceRange::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1);
-            let view_info = vk::ImageViewCreateInfo::builder()
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .subresource_range(*subresource_range)
-                .format(vk::Format::R8_UNORM);
-            Image::new(device, *image_info, *view_info, vk::MemoryPropertyFlags::DEVICE_LOCAL)?
+            let req = ImageReq {
+                usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+                format: vk::Format::R8_UNORM,
+                extent,
+            };
+
+            Image::new(&renderer, vk::MemoryPropertyFlags::DEVICE_LOCAL, req)?
         };
 
-        device.transfer_with(|recorder| {
+        renderer.device.transfer_with(|recorder| {
             recorder.transition_image_layout(&mut glyph_atlas, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
             recorder.copy_buffer_to_image(&staging, &glyph_atlas);
             recorder.transition_image_layout(&mut glyph_atlas, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         })?;
 
-        let descriptor = DescriptorSet::new_single(device, None, &[
-            DescriptorBinding {
+        let layout = DescriptorSetLayout::new(&renderer, &[
+            LayoutBinding {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
-                kind: BindingKind::Image(&sampler, [&glyph_atlas]),
-            },
+            }
+        ])?;
+
+        let descriptor = DescriptorSet::new_single(&renderer, layout, &[
+            DescriptorBinding::Image(sampler.clone(), [glyph_atlas.clone()]),
         ])?;
 
         let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::builder()
@@ -172,8 +133,8 @@ impl TextPass {
         let vertex_code = include_bytes_aligned_as!(u32, "../shaders/sdf_vert.spv");
         let fragment_code = include_bytes_aligned_as!(u32, "../shaders/sdf_frag.spv");
 
-        let vertex_module = ShaderModule::new(&device, "main", vertex_code)?;
-        let fragment_module = ShaderModule::new(&device, "main", fragment_code)?;
+        let vertex_module = ShaderModule::new(&renderer, "main", vertex_code)?;
+        let fragment_module = ShaderModule::new(&renderer, "main", fragment_code)?;
 
         let push_consts = [vk::PushConstantRange::builder()
             .stage_flags(vk::ShaderStageFlags::VERTEX)
@@ -181,8 +142,8 @@ impl TextPass {
             .offset(0)
             .build()];
 
-        let pipeline = GraphicsPipeline::new(device, GraphicsPipelineReq {
-            layout: PipelineLayout::new(device, &push_consts, &[descriptor.layout.clone()])?,
+        let pipeline = GraphicsPipeline::new(&renderer, GraphicsPipelineReq {
+            layout: PipelineLayout::new(&renderer, &push_consts, &[descriptor.layout.clone()])?,
             vertex_attributes: &[
                 vk::VertexInputAttributeDescription {
                     format: vk::Format::R32G32B32_SFLOAT,
@@ -205,30 +166,18 @@ impl TextPass {
             depth_stencil_info: &depth_stencil_info,
             vertex_shader: &vertex_module,
             fragment_shader: &fragment_module,
-            swapchain,
-            render_pass,
-            render_targets,
         })?;
 
-        let width = swapchain.extent.width as f32;
-        let height = swapchain.extent.height as f32;
+        let width = renderer.swapchain.extent.width as f32;
+        let height = renderer.swapchain.extent.height as f32;
         let proj = Mat4::orthographic_lh(0.0, width, 0.0, height, 0.0, 1.0);
 
-        Ok(Self {
-            mapped,
-            text_objects,
-            proj,
-            sampler,
-            pipeline, 
-            descriptor,
-            buffers,
-            glyph_atlas,
-        })
+        Ok(Self { mapped, text_objects, proj, pipeline, descriptor, buffers })
     }
 
-    pub fn handle_resize(&mut self, swapchain: &Swapchain) {
-        let width = swapchain.extent.width as f32;
-        let height = swapchain.extent.height as f32;
+    pub fn handle_resize(&mut self, renderer: &Renderer) {
+        let width = renderer.swapchain.extent.width as f32;
+        let height = renderer.swapchain.extent.height as f32;
         self.proj = Mat4::orthographic_lh(0.0, width, 0.0, height, 0.0, 1.0);
     }
 

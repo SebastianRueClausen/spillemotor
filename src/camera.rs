@@ -6,6 +6,7 @@ use anyhow::Result;
 
 use std::{mem, iter};
 use std::time::Duration;
+use std::rc::Rc;
 
 use crate::core::*;
 use crate::InputState;
@@ -144,10 +145,10 @@ pub struct ProjUniform {
 }
 
 impl ProjUniform {
-    pub fn new(camera: &Camera, swapchain: &Swapchain) -> Self {
+    pub fn new(renderer: &Renderer, camera: &Camera) -> Self {
         let dimensions = Vec2::new(
-            swapchain.extent.width as f32,
-            swapchain.extent.height as f32,
+            renderer.swapchain.extent.width as f32,
+            renderer.swapchain.extent.height as f32,
         );
         let inverse_proj = camera.proj.inverse();
         let z_plane = Vec2::new(camera.z_near, camera.z_far);
@@ -172,12 +173,12 @@ impl ProjUniform {
 /// | 1     | view    |
 ///
 pub struct CameraUniforms {
-    buffers: Vec<Buffer>,
+    buffers: Vec<Rc<Buffer>>,
     mapped: MappedMemory,
 }
 
 impl CameraUniforms {
-    pub fn new(device: &Device, camera: &Camera, swapchain: &Swapchain) -> Result<Self> {
+    pub fn new(renderer: &Renderer, camera: &Camera) -> Result<Self> {
         let proj_info = vk::BufferCreateInfo::builder()
             .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -193,16 +194,26 @@ impl CameraUniforms {
             .chain(iter::repeat(view_info).take(FRAMES_IN_FLIGHT))
             .collect();
 
-        let alignment = device.device_properties.limits.non_coherent_atom_size;
+        let alignment = renderer
+            .device
+            .device_properties
+            .limits
+            .non_coherent_atom_size;
+
         let memory_flags = vk::MemoryPropertyFlags::HOST_VISIBLE
             | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-        let (buffers, block) = resource::create_buffers(device, &infos, memory_flags, alignment)?;
-        let mapped = MappedMemory::new(&block)?;
+        let (buffers, block) = resource::create_buffers(
+            &renderer,
+            &infos,
+            memory_flags,
+            alignment,
+        )?;
 
+        let mapped = MappedMemory::new(block.clone())?;
         let uniforms = Self { buffers, mapped };
 
-        uniforms.update_proj(camera, swapchain);
+        uniforms.update_proj(renderer, camera);
 
         Ok(uniforms)
     }
@@ -215,18 +226,18 @@ impl CameraUniforms {
             .copy_from_slice(bytemuck::bytes_of(&view));
     }
 
-    pub fn update_proj(&self, camera: &Camera, swapchain: &Swapchain) {
-        let proj = ProjUniform::new(camera, swapchain);
+    pub fn update_proj(&self, renderer: &Renderer, camera: &Camera) {
+        let proj = ProjUniform::new(renderer, camera);
         self.mapped
             .get_buffer_data(self.proj_uniform())
             .copy_from_slice(bytemuck::bytes_of(&proj));
     }
 
-    pub fn proj_uniform(&self) -> &Buffer {
+    pub fn proj_uniform(&self) -> &Rc<Buffer> {
         &self.buffers[0]
     }
 
-    pub fn view_uniform(&self, frame: usize) -> &Buffer {
+    pub fn view_uniform(&self, frame: usize) -> &Rc<Buffer> {
         &self.buffers[1 + frame]
     }
 }
