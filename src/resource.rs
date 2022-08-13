@@ -538,7 +538,6 @@ impl Drop for BumpBlock {
     }
 }
 
-#[derive(Default)]
 struct BumpBlocks {
     /// The current block used to allocate new objects.
     ///
@@ -551,11 +550,27 @@ struct BumpBlocks {
     /// A block counts as full if it's too small to allocate a single object. This is ofcourse not
     /// memory effecient, but guarentees constants time allocations.
     full_blocks: RefCell<Vec<BumpBlock>>,
+
+    block_size: usize,
 }
 
-const BASE_BLOCK_SIZE: usize = 1024;
+const DEFAULT_BLOCK_SIZE: usize = 1024;
+
+impl Default for BumpBlocks {
+    fn default() -> Self {
+        Self {
+            current_block: Cell::new(None),
+            full_blocks: RefCell::new(Vec::new()),
+            block_size: DEFAULT_BLOCK_SIZE,
+        }
+    }
+}
 
 impl BumpBlocks {
+    fn with_block_size(block_size: usize) -> Self {
+        Self { block_size, ..Self::default() }
+    }
+
     fn alloc<T>(&self, val: T) -> NonNull<T> {
         let mut size = mem::size_of::<T>();
 
@@ -563,7 +578,7 @@ impl BumpBlocks {
             let block = self.current_block
                 .replace(None)
                 .unwrap_or_else(|| {
-                    let mut block_size = BASE_BLOCK_SIZE;
+                    let mut block_size = self.block_size;
                     while size > block_size {
                         block_size *= 2;
                     }
@@ -592,44 +607,28 @@ impl BumpBlocks {
     }
 }
 
-/// Item which will call drop for another object when dropped.
-struct DropItem {
-    drop_func: unsafe fn(NonNull<c_void>),
-    ptr: NonNull<c_void>,
-}
-
-impl Drop for DropItem {
-    fn drop(&mut self) {
-        unsafe { (self.drop_func)(self.ptr) }
-    }
-}
-
 #[derive(Default)]
 struct SharedResources {
     /// The memory blocks where all the CPU resources are allocated.
     blocks: BumpBlocks,
-
-    /// Holds reference counted reference to other resource pools this pool depend on to make sure
-    /// they live longer than this.
-    dependencies: RefCell<HashSet<ResourcePool>>,
-
-    /// This is to drop items allocated from this pool.
-    drop_stack: RefCell<Vec<DropItem>>, 
 }
 
-/// A pool of resources all if which have the same lifetime.
+impl SharedResources {
+    fn with_block_size(block_size: usize) -> Self {
+        Self { blocks: BumpBlocks::with_block_size(block_size) }
+    }
+}
+
+/// A pool of resources.
 ///
 /// When allocating an item of type `T` via `alloc`, you receivce an reference object of type
 /// `Res<T>`. This is guarenteed to be valid for it's whole lifetime.
 ///
-/// If `T` implements `Drop`, then drop will be called when the pool is destroyd, which only
-/// happens when all resources allocated goes out of scope.
+/// This should be kept in mind when used. A single [`Res`] may keep the whole pool alive longer
+/// than expected, which could be a waste of memory.
 ///
-/// This should be kept in mind when used. A single [`Ref`] may keep the whole pool alive longer
-/// than expected.
-///
-/// Pools may depend on other pools via the function `add_dependency`. This guarentees that pools
-/// will live at least as long as the pools they depend.
+/// If `T` implements `Drop`, then drop will be called for each [`Res`] once the last copy goes out
+/// of scope.
 #[derive(Default, Clone)]
 pub struct ResourcePool {
     shared: Rc<SharedResources>,
@@ -654,39 +653,60 @@ impl ResourcePool {
         Self::default()
     }
 
+    pub fn with_block_size(block_size: usize) -> Self {
+        Self { shared: Rc::new(SharedResources::with_block_size(block_size)) }
+    }
+
     #[must_use]
     #[inline]
     pub fn alloc<T>(&self, val: T) -> Res<T> {
-        let ptr = self.shared.blocks.alloc::<T>(val);
-
-        if mem::needs_drop::<T>() {
-            unsafe {
-                self.shared.drop_stack.borrow_mut().push(DropItem {
-                    ptr: ptr.cast(),
-                    drop_func: mem::transmute::<unsafe fn(*mut T), unsafe fn(NonNull<c_void>)>(
-                        ptr::drop_in_place::<T>
-                    ),
-                });
-            }
-        }
+        let ptr = self.shared.blocks.alloc::<ResState<T>>(ResState {
+            val, ref_count: Cell::new(1),
+        });
 
         Res { ptr, pool: self.clone() } 
     }
-
-    #[inline]
-    pub fn add_dependency(&self, pool: &ResourcePool) {
-        self.shared.dependencies
-            .borrow_mut()
-            .insert(pool.clone());
-    }
 }
 
-#[derive(Clone)]
+struct ResState<T> {
+    /// The number of references to the item.
+    ref_count: Cell<u32>,
+
+    /// The resource value.
+    val: T,
+}
+
 pub struct Res<T> {
-    ptr: NonNull<T>,
+    ptr: NonNull<ResState<T>>,
 
     #[allow(dead_code)]
     pool: ResourcePool,
+}
+
+impl<T> Clone for Res<T> {
+    fn clone(&self) -> Self {
+        if mem::needs_drop::<T>() {
+            unsafe {
+                self.ptr.as_ref().ref_count.set(self.ptr.as_ref().ref_count.get() + 1);
+            }
+        }
+
+        Self { ptr: self.ptr, pool: self.pool.clone() }
+    }
+}
+
+impl<T> Drop for Res<T> {
+    fn drop(&mut self) {
+        if mem::needs_drop::<T>() {
+            unsafe {
+                if self.ptr.as_ref().ref_count.get() == 1 {
+                    ptr::drop_in_place::<T>((&mut self.ptr.as_mut().val) as *mut T);
+                } else {
+                    self.ptr.as_ref().ref_count.set(self.ptr.as_ref().ref_count.get() - 1);
+                }
+            }
+        }
+    }
 }
 
 impl<T> PartialEq for Res<T> {
@@ -701,7 +721,7 @@ impl<T> ops::Deref for Res<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { self.ptr.as_ref() }
+        unsafe { &self.ptr.as_ref().val }
     }
 }
 
@@ -818,6 +838,32 @@ fn destroy() {
 
         let _ = p1.alloc(Test(0));
         let _ = p1.alloc(Test(0));
+    }
+
+    assert_eq!(unsafe { COUNT }, 2);
+}
+
+#[test]
+fn self_ref() {
+    static mut COUNT: usize = 0;
+
+    struct Test {
+        val: Res<usize>,
+    }
+
+    impl Drop for Test {
+        fn drop(&mut self) {
+            unsafe { COUNT += 1; }
+        }
+    }
+    
+    {
+        let p1 = ResourcePool::new();
+
+        let val = p1.alloc(0_usize);
+
+        let t1 = p1.alloc(Test { val: val.clone() });
+        let t2 = p1.alloc(Test { val: val.clone() });
     }
 
     assert_eq!(unsafe { COUNT }, 2);
