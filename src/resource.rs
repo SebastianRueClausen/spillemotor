@@ -2,9 +2,13 @@ use anyhow::Result;
 use smallvec::SmallVec;
 use ash::vk;
 
-use std::{ops, slice};
+use std::{ops, slice, alloc, mem};
 use std::rc::Rc;
-use std::cell::Cell;
+use std::cell::{RefCell, Cell};
+use std::ptr::{self, NonNull};
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::ffi::c_void;
 
 use crate::core::{Renderer, Device};
 use crate::handle::Handle;
@@ -482,6 +486,225 @@ impl Drop for TextureSampler {
     }
 }
 
+#[repr(C)]
+struct BumpBlock {
+    /// The first byte of the block.
+    base: NonNull<u8>,
+
+    /// The offset into `base` thats points at the first free byte.
+    offset: Cell<usize>,
+
+    /// The layout of the block.
+    layout: alloc::Layout,
+}
+
+impl BumpBlock {
+    fn new(size: usize) -> Self {
+        let (base, layout) = unsafe {
+            let layout = alloc::Layout::from_size_align_unchecked(size, 1);
+            let base = NonNull::new(alloc::alloc(layout)).expect("out of memory");
+
+            (base, layout)
+        };
+
+        Self { base, layout, offset: Cell::new(0) }
+    }
+
+    fn alloc<T>(&self) -> Option<NonNull<T>> {
+        let (size, align) = (mem::size_of::<T>(), mem::align_of::<T>());
+
+        let offset = self.offset.get();
+
+        unsafe {
+            let ptr = self.base.as_ptr().add(offset);
+            let align_offset = ptr.align_offset(align);
+
+            let start = ptr.add(ptr.align_offset(align));
+            let end = start.add(size);
+
+            if end > self.base.as_ptr().add(self.layout.size()) {
+                None
+            } else {
+                self.offset.set(offset + align_offset + size);
+                Some(NonNull::new_unchecked(start.cast()))
+            }
+        }
+    }
+}
+
+impl Drop for BumpBlock {
+    fn drop(&mut self) {
+        unsafe { alloc::dealloc(self.base.as_ptr(), self.layout) }
+    }
+}
+
+#[derive(Default)]
+struct BumpBlocks {
+    /// The current block used to allocate new objects.
+    ///
+    /// This block is never in `full_blocks`, and once it's pushed into `full_blocks` it never
+    /// leaves.
+    current_block: Cell<Option<BumpBlock>>,
+
+    /// Blocks that are "full".
+    ///
+    /// A block counts as full if it's too small to allocate a single object. This is ofcourse not
+    /// memory effecient, but guarentees constants time allocations.
+    full_blocks: RefCell<Vec<BumpBlock>>,
+}
+
+const BASE_BLOCK_SIZE: usize = 1024;
+
+impl BumpBlocks {
+    fn alloc<T>(&self, val: T) -> NonNull<T> {
+        let mut size = mem::size_of::<T>();
+
+        let (block, ptr) = loop {
+            let block = self.current_block
+                .replace(None)
+                .unwrap_or_else(|| {
+                    let mut block_size = BASE_BLOCK_SIZE;
+                    while size > block_size {
+                        block_size *= 2;
+                    }
+
+                    // Rare (impossible?) case where the allocation fails even if the block size is
+                    // the the same size as the allocation because of aligment offsets.
+                    size = block_size + 1;
+
+                    BumpBlock::new(block_size)            
+                });
+
+            let Some(ptr) = block.alloc::<T>() else {
+                self.full_blocks.borrow_mut().push(block);
+
+                continue;
+            };
+
+            break (block, ptr);
+        };
+
+        unsafe { ptr.as_ptr().write(val); }
+       
+        self.current_block.set(Some(block));
+       
+        ptr
+    }
+}
+
+/// Item which will call drop for another object when dropped.
+struct DropItem {
+    drop_func: unsafe fn(NonNull<c_void>),
+    ptr: NonNull<c_void>,
+}
+
+impl Drop for DropItem {
+    fn drop(&mut self) {
+        unsafe { (self.drop_func)(self.ptr) }
+    }
+}
+
+#[derive(Default)]
+struct SharedResources {
+    /// The memory blocks where all the CPU resources are allocated.
+    blocks: BumpBlocks,
+
+    /// Holds reference counted reference to other resource pools this pool depend on to make sure
+    /// they live longer than this.
+    dependencies: RefCell<HashSet<ResourcePool>>,
+
+    /// This is to drop items allocated from this pool.
+    drop_stack: RefCell<Vec<DropItem>>, 
+}
+
+/// A pool of resources all if which have the same lifetime.
+///
+/// When allocating an item of type `T` via `alloc`, you receivce an reference object of type
+/// `Res<T>`. This is guarenteed to be valid for it's whole lifetime.
+///
+/// If `T` implements `Drop`, then drop will be called when the pool is destroyd, which only
+/// happens when all resources allocated goes out of scope.
+///
+/// This should be kept in mind when used. A single [`Ref`] may keep the whole pool alive longer
+/// than expected.
+///
+/// Pools may depend on other pools via the function `add_dependency`. This guarentees that pools
+/// will live at least as long as the pools they depend.
+#[derive(Default, Clone)]
+pub struct ResourcePool {
+    shared: Rc<SharedResources>,
+}
+
+impl PartialEq for ResourcePool {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::as_ptr(&self.shared) == Rc::as_ptr(&other.shared)
+    }
+}
+
+impl Eq for ResourcePool {}
+
+impl Hash for ResourcePool {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Rc::as_ptr(&self.shared).hash(state);
+    }
+}
+
+impl ResourcePool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn alloc<T>(&self, val: T) -> Res<T> {
+        let ptr = self.shared.blocks.alloc::<T>(val);
+
+        if mem::needs_drop::<T>() {
+            unsafe {
+                self.shared.drop_stack.borrow_mut().push(DropItem {
+                    ptr: ptr.cast(),
+                    drop_func: mem::transmute::<unsafe fn(*mut T), unsafe fn(NonNull<c_void>)>(
+                        ptr::drop_in_place::<T>
+                    ),
+                });
+            }
+        }
+
+        Res { ptr, pool: self.clone() } 
+    }
+
+    #[inline]
+    pub fn add_dependency(&self, pool: &ResourcePool) {
+        self.shared.dependencies
+            .borrow_mut()
+            .insert(pool.clone());
+    }
+}
+
+#[derive(Clone)]
+pub struct Res<T> {
+    ptr: NonNull<T>,
+
+    #[allow(dead_code)]
+    pool: ResourcePool,
+}
+
+impl<T> PartialEq for Res<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr == other.ptr
+    }
+}
+
+impl<T> Eq for Res<T> {}
+
+impl<T> ops::Deref for Res<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
 /// Find a memory type index fitting `props`, `flags` and `memory_type_bits`.
 ///
 /// Returns `None` if there is no memory type fits the three parameters.
@@ -556,4 +779,46 @@ fn test_gcd() {
     assert_eq!(gcd(3, 4), 1);
     assert_eq!(gcd(2, 4), 2);
     assert_eq!(gcd(10, 12), 2);
+}
+
+#[test]
+fn simple_alloc() {
+    let p1 = ResourcePool::new();
+
+    let nums: Vec<_> = (0..2048)
+        .map(|i| p1.alloc(i as usize))
+        .collect();
+
+    for (i, j) in nums.into_iter().enumerate() {
+        assert_eq!(i, *j);
+    }
+}
+
+#[test]
+fn big_alloc() {
+    let p1 = ResourcePool::new();
+
+    let _big_thing = p1.alloc([0_u32; 1024]);
+    let _big_thing = p1.alloc([0_u32; 2048]);
+}
+
+#[test]
+fn destroy() {
+    static mut COUNT: usize = 0;
+
+    struct Test(usize);
+    impl Drop for Test {
+        fn drop(&mut self) {
+            unsafe { COUNT += 1; }
+        }
+    }
+    
+    {
+        let p1 = ResourcePool::new();
+
+        let _ = p1.alloc(Test(0));
+        let _ = p1.alloc(Test(0));
+    }
+
+    assert_eq!(unsafe { COUNT }, 2);
 }
