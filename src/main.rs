@@ -14,7 +14,6 @@ mod core;
 mod scene;
 mod light;
 mod text;
-mod handle;
 mod camera;
 
 mod gltf_import;
@@ -33,6 +32,7 @@ use crate::text::TextPass;
 use crate::scene::Scene;
 use crate::light::{Lights, PointLight};
 use crate::camera::{Camera, CameraUniforms};
+use crate::resource::ResourcePool;
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -54,18 +54,20 @@ fn main() -> Result<()> {
     let mut renderer = Renderer::new(&window)?;
     let mut input_state = InputState::default();
 
+    let resource_pool = ResourcePool::new();
+
     let font = font_import::FontData::new(Path::new("fonts/source_code_pro/metadata.json"))?;
 
-    let mut text_pass = TextPass::new(&renderer, &font)?;
+    let mut text_pass = TextPass::new(&renderer, &resource_pool, &font)?;
 
     let mut camera = Camera::new(renderer.swapchain.aspect_ratio());
-    let camera_uniforms = CameraUniforms::new(&renderer, &camera)?;
+    let camera_uniforms = CameraUniforms::new(&renderer, &resource_pool, &camera)?;
 
     let lights = debug_lights();
-    let mut lights = Lights::new(&renderer, &camera_uniforms, &camera, &lights)?;
+    let mut lights = Lights::new(&renderer, &resource_pool, &camera_uniforms, &camera, &lights)?;
 
     let scene_data = gltf_import::load(Path::new("models/sponza/Sponza.gltf"))?;
-    let scene = Scene::from_scene_data(&renderer, &camera_uniforms, &lights, &scene_data)?;
+    let scene = Scene::from_scene_data(&renderer, &resource_pool, &camera_uniforms, &lights, &scene_data)?;
 
     event_loop.run(move |event, _, controlflow| match event {
         Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
@@ -150,7 +152,7 @@ fn main() -> Result<()> {
                             );
                            
                             recorder.push_constants(
-                                &scene.render_pipeline.layout,
+                                &scene.render_pipeline.layout(),
                                 vk::ShaderStageFlags::VERTEX,
                                 0,
                                 *&model.transform(),

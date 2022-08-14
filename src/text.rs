@@ -5,11 +5,12 @@ use smallvec::SmallVec;
 use nohash_hasher::NoHashHasher;
 
 use std::{mem, iter, hash};
-use std::rc::Rc;
 use std::collections::HashMap;
 
 use crate::core::*;
-use crate::resource::{self, Buffer, Image, ImageReq, MappedMemory, TextureSampler};
+use crate::resource::{
+    self, Buffer, Image, ImageReq, MappedMemory, TextureSampler, ResourcePool, Res,
+};
 use crate::font_import::{FontData, Glyph};
 
 #[repr(C)]
@@ -35,7 +36,7 @@ pub struct TextPass {
     /// | 0     | index  |
     /// | 1     | index  |
     ///
-    buffers: Vec<Rc<Buffer>>,
+    buffers: Vec<Res<Buffer>>,
 
     mapped: MappedMemory,
 
@@ -48,7 +49,7 @@ pub struct TextPass {
 }
 
 impl TextPass {
-    pub fn new(renderer: &Renderer, font: &FontData) -> Result<Self> {
+    pub fn new(renderer: &Renderer, pool: &ResourcePool, font: &FontData) -> Result<Self> {
         let text_objects = TextObjects::new(FontAtlas::new(font));
 
         let (buffers, block) = {
@@ -68,7 +69,7 @@ impl TextPass {
                 .collect();
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-            resource::create_buffers(&renderer, &infos, memory_flags, 4)?
+            resource::create_buffers(&renderer, pool, &infos, memory_flags, 4)?
         };
 
         let mapped = MappedMemory::new(block.clone())?;
@@ -82,7 +83,7 @@ impl TextPass {
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-            let staging = Buffer::new(&renderer, &create_info, memory_flags)?;
+            let staging = Buffer::new(&renderer, pool, &create_info, memory_flags)?;
             let mapped = MappedMemory::new(staging.block.clone())?;
 
             mapped.get_buffer_data(&staging).copy_from_slice(font.atlas.as_slice());
@@ -96,7 +97,7 @@ impl TextPass {
             depth: 1,
         };
 
-        let sampler = TextureSampler::new(&renderer)?;
+        let sampler = pool.alloc(TextureSampler::new(&renderer)?);
     
         let mut glyph_atlas = {
             let req = ImageReq {
@@ -105,7 +106,7 @@ impl TextPass {
                 extent,
             };
 
-            Image::new(&renderer, vk::MemoryPropertyFlags::DEVICE_LOCAL, req)?
+            Image::new(&renderer, pool, vk::MemoryPropertyFlags::DEVICE_LOCAL, req)?
         };
 
         renderer.device.transfer_with(|recorder| {
@@ -114,12 +115,12 @@ impl TextPass {
             recorder.transition_image_layout(&mut glyph_atlas, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         })?;
 
-        let layout = DescriptorSetLayout::new(&renderer, &[
+        let layout = pool.alloc(DescriptorSetLayout::new(&renderer, &[
             LayoutBinding {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
             }
-        ])?;
+        ])?);
 
         let descriptor = DescriptorSet::new_single(&renderer, layout, &[
             DescriptorBinding::Image(sampler.clone(), [glyph_atlas.clone()]),
@@ -142,8 +143,12 @@ impl TextPass {
             .offset(0)
             .build()];
 
+        let layout = pool.alloc(
+            PipelineLayout::new(&renderer, &push_consts, &[descriptor.layout.clone()])?
+        );
+
         let pipeline = GraphicsPipeline::new(&renderer, GraphicsPipelineReq {
-            layout: PipelineLayout::new(&renderer, &push_consts, &[descriptor.layout.clone()])?,
+            layout,
             vertex_attributes: &[
                 vk::VertexInputAttributeDescription {
                     format: vk::Format::R32G32B32_SFLOAT,

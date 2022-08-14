@@ -3,10 +3,9 @@ use ash::vk;
 use anyhow::Result;
 
 use std::{iter, mem};
-use std::rc::Rc;
 
 use crate::camera::{Camera, CameraUniforms};
-use crate::resource::{self, MappedMemory, Buffer};
+use crate::resource::{self, MappedMemory, Buffer, ResourcePool, Res};
 use crate::core::*;
 
 #[repr(C)]
@@ -129,13 +128,13 @@ impl ClusterInfo {
 }
 
 pub struct ClusterInfoBuffer {
-    pub buffer: Rc<Buffer>,
+    pub buffer: Res<Buffer>,
     mapped: MappedMemory,
     pub info: ClusterInfo,
 }
 
 impl ClusterInfoBuffer {
-    fn new(renderer: &Renderer, camera: &Camera) -> Result<Self> {
+    fn new(renderer: &Renderer, pool: &ResourcePool, camera: &Camera) -> Result<Self> {
         let info = vk::BufferCreateInfo::builder()
             .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
             .size(mem::size_of::<ClusterInfo>() as u64)
@@ -145,7 +144,7 @@ impl ClusterInfoBuffer {
         let memory_flags =
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-        let buffer = Buffer::new(&renderer, &info, memory_flags)?;
+        let buffer = Buffer::new(&renderer, pool, &info, memory_flags)?;
         let mapped = MappedMemory::new(buffer.block.clone())?;
         let info = ClusterInfo::new(&renderer.swapchain, camera);
 
@@ -229,7 +228,7 @@ struct LightMask {
 /// of lights and `k` the number of clusters, this will hopefully speed things up.
 ///
 pub struct Lights {
-    pub buffers: Vec<Rc<Buffer>>,
+    pub buffers: Vec<Res<Buffer>>,
     pub light_count: u32,
     pub cluster_info: ClusterInfoBuffer,
     pub cluster_build: ComputeProgram,
@@ -240,11 +239,12 @@ pub struct Lights {
 impl Lights {
     pub fn new(
         renderer: &Renderer,
+        pool: &ResourcePool,
         camera_uniforms: &CameraUniforms,
         camera: &Camera,
         lights: &[PointLight],
     ) -> Result<Self> {
-        let cluster_info = ClusterInfoBuffer::new(renderer, camera)?;
+        let cluster_info = ClusterInfoBuffer::new(renderer, pool, camera)?;
         let cluster_count = cluster_info.info.cluster_count() as usize;
 
         let light_buffer = vk::BufferCreateInfo::builder()
@@ -282,7 +282,7 @@ impl Lights {
                 create_infos.push(info); 
             }
 
-            let (buffers, _) = resource::create_buffers(&renderer, &create_infos, memory_flags, 4)?;
+            let (buffers, _) = resource::create_buffers(&renderer, pool, &create_infos, memory_flags, 4)?;
 
             buffers
         };
@@ -296,7 +296,7 @@ impl Lights {
             let memory_flags =
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-            let buffer = Buffer::new(&renderer, &info, memory_flags)?;
+            let buffer = Buffer::new(&renderer, pool, &info, memory_flags)?;
             let light_data = LightBufferData::new(lights); 
 
             MappedMemory::new(buffer.block.clone())?
@@ -311,7 +311,7 @@ impl Lights {
         })?;
 
         let cluster_build = {
-            let layout = DescriptorSetLayout::new(&renderer, &[
+            let layout = pool.alloc(DescriptorSetLayout::new(&renderer, &[
                 LayoutBinding {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
@@ -324,7 +324,7 @@ impl Lights {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
                 },
-            ])?;
+            ])?);
 
             let descriptor = DescriptorSet::new_single(&renderer, layout, &[
                 DescriptorBinding::Buffer([cluster_info.buffer.clone()]),
@@ -336,14 +336,17 @@ impl Lights {
             let code = include_bytes_aligned_as!(u32, "../shaders/cluster_build.spv");
             let shader = ShaderModule::new(&renderer, "main", code)?;
 
-            let layout = PipelineLayout::new(&renderer, &[], &[descriptor.layout.clone()])?;
+            let layout = pool.alloc(
+                PipelineLayout::new(&renderer, &[], &[descriptor.layout.clone()])?
+            );
+
             let pipeline = ComputePipeline::new(&renderer, layout, &shader)?;
 
             ComputeProgram { pipeline, descriptor }
         };
 
         let light_update = {
-            let layout = DescriptorSetLayout::new(&renderer, &[
+            let layout = pool.alloc(DescriptorSetLayout::new(&renderer, &[
                 LayoutBinding {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
@@ -356,7 +359,7 @@ impl Lights {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
                 },
-            ])?;
+            ])?);
 
             let descriptor = DescriptorSet::new_per_frame(&renderer, layout, &[
                 DescriptorBinding::Buffer([
@@ -372,14 +375,17 @@ impl Lights {
             let code = include_bytes_aligned_as!(u32, "../shaders/light_update.spv");
             let shader = ShaderModule::new(&renderer, "main", code)?;
 
-            let layout = PipelineLayout::new(&renderer, &[], &[descriptor.layout.clone()])?;
+            let layout = pool.alloc(
+                PipelineLayout::new(&renderer, &[], &[descriptor.layout.clone()])?
+            );
+
             let pipeline = ComputePipeline::new(&renderer, layout, &shader)?;
 
             ComputeProgram { pipeline, descriptor }
         };
 
         let cluster_update = {
-            let layout = DescriptorSetLayout::new(&renderer, &[
+            let layout = pool.alloc(DescriptorSetLayout::new(&renderer, &[
                 LayoutBinding {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
@@ -396,7 +402,7 @@ impl Lights {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
                     stage: vk::ShaderStageFlags::COMPUTE,
                 },
-            ])?;
+            ])?);
 
             let descriptor = DescriptorSet::new_per_frame(&renderer, layout, &[
                 // Light buffer.
@@ -412,7 +418,10 @@ impl Lights {
             let code = include_bytes_aligned_as!(u32, "../shaders/cluster_update.spv");
             let shader = ShaderModule::new(&renderer, "main", code)?;
 
-            let layout = PipelineLayout::new(&renderer, &[], &[descriptor.layout.clone()])?;
+            let layout = pool.alloc(
+                PipelineLayout::new(&renderer, &[], &[descriptor.layout.clone()])?
+            );
+
             let pipeline = ComputePipeline::new(&renderer, layout, &shader)?;
 
             ComputeProgram { pipeline, descriptor }
@@ -447,20 +456,20 @@ impl Lights {
         })
     }
 
-    pub fn light_buffer(&self) -> &Rc<Buffer> {
+    pub fn light_buffer(&self) -> &Res<Buffer> {
         &self.buffers[0]
     }
 
     #[allow(unused)]
-    pub fn cluster_aabb_buffer(&self) -> &Rc<Buffer> {
+    pub fn cluster_aabb_buffer(&self) -> &Res<Buffer> {
         &self.buffers[1]
     }
 
-    pub fn light_mask_buffer(&self, frame: usize) -> &Rc<Buffer> {
+    pub fn light_mask_buffer(&self, frame: usize) -> &Res<Buffer> {
         &self.buffers[2 + frame]
     }
 
-    pub fn light_position_buffer(&self, frame: usize) -> &Rc<Buffer> {
+    pub fn light_position_buffer(&self, frame: usize) -> &Res<Buffer> {
         &self.buffers[4 + frame]
     }
 

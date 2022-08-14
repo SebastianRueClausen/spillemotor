@@ -6,23 +6,20 @@ use std::{ops, slice, alloc, mem};
 use std::rc::Rc;
 use std::cell::{RefCell, Cell};
 use std::ptr::{self, NonNull};
-use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use std::ffi::c_void;
 
 use crate::core::{Renderer, Device};
-use crate::handle::Handle;
 
 type MemoryRange = ops::Range<vk::DeviceSize>;
 
 /// A wrapper around a raw ptr into a mapped memory block.
 pub struct MappedMemory {
     ptr: *mut u8,
-    block: Handle<MemoryBlock>,
+    block: Res<MemoryBlock>,
 }
 
 impl MappedMemory {
-    pub fn new(block: Handle<MemoryBlock>) -> Result<Self> {
+    pub fn new(block: Res<MemoryBlock>) -> Result<Self> {
         let ptr = unsafe {
             block.device.handle
                 .map_memory(block.handle, 0, block.size, vk::MemoryMapFlags::empty())
@@ -63,18 +60,18 @@ pub struct MemoryBlock {
 
     size: vk::DeviceSize,
 
-    device: Device,
+    device: Res<Device>,
 }
 
 impl MemoryBlock {
     fn new(
-        device: &Device,
+        device: Res<Device>,
         properties: vk::MemoryPropertyFlags,
         info: &vk::MemoryAllocateInfo,
-    ) -> Result<Handle<Self>> {
+    ) -> Result<Self> {
         let handle = unsafe { device.handle.allocate_memory(info, None)? };
         let size = info.allocation_size;
-        Ok(Handle::new(Self { device: device.clone(), handle, properties, size }))
+        Ok(Self { device: device.clone(), handle, properties, size })
     }
 
     #[allow(dead_code)]
@@ -100,16 +97,17 @@ impl Eq for MemoryBlock {}
 #[derive(Clone)]
 pub struct Buffer {
     pub handle: vk::Buffer,
-    pub block: Handle<MemoryBlock>,
+    pub block: Res<MemoryBlock>,
     pub range: MemoryRange,
 }
 
 impl Buffer {
     pub fn new(
         renderer: &Renderer,
+        pool: &ResourcePool,
         info: &vk::BufferCreateInfo,
         memory_flags: vk::MemoryPropertyFlags,
-    ) -> Result<Rc<Self>> {
+    ) -> Result<Res<Self>> {
         let device = renderer.device.clone();
 
         let handle = unsafe { device.handle.create_buffer(info, None)? };
@@ -134,10 +132,10 @@ impl Buffer {
             alloc_info = alloc_info.push_next(&mut alloc_flags);
         }
 
-        let block = MemoryBlock::new(&device, memory_flags, &alloc_info)?;
+        let block = pool.alloc(MemoryBlock::new(device.clone(), memory_flags, &alloc_info)?);
         unsafe { device.handle.bind_buffer_memory(handle, block.handle, 0)?; }
 
-        Ok(Rc::new(Self { handle, range: 0..block.size, block }))
+        Ok(pool.alloc(Self { handle, range: 0..block.size, block }))
     }
 
     pub fn size(&self) -> vk::DeviceSize {
@@ -153,10 +151,11 @@ impl Drop for Buffer {
 
 pub fn create_buffers(
     renderer: &Renderer,
+    pool: &ResourcePool,
     create_infos: &[vk::BufferCreateInfo],
     memory_flags: vk::MemoryPropertyFlags,
     alignment: vk::DeviceSize,
-) -> Result<(Vec<Rc<Buffer>>, Handle<MemoryBlock>)> {
+) -> Result<(Vec<Res<Buffer>>, Res<MemoryBlock>)> {
     let device = renderer.device.clone();
 
     let mut memory_type_bits = u32::MAX;
@@ -206,11 +205,11 @@ pub fn create_buffers(
         alloc_info = alloc_info.push_next(&mut flags)
     }
 
-    let block = MemoryBlock::new(&device, memory_flags, &alloc_info)?;
+    let block = pool.alloc(MemoryBlock::new(device.clone(), memory_flags, &alloc_info)?);
 
     let buffers: Vec<_> = buffers
         .into_iter()
-        .map(|(handle, range)| Rc::new(Buffer {
+        .map(|(handle, range)| pool.alloc(Buffer {
             block: block.clone(),
             handle,
             range,
@@ -273,11 +272,11 @@ pub struct Image {
     pub extent: vk::Extent3D,
     pub format: vk::Format,
 
-    /// Layout is mutable.
+    // Layout may change.
     pub layout: Cell<vk::ImageLayout>,
 
     pub range: MemoryRange,
-    pub block: Handle<MemoryBlock>,
+    pub block: Res<MemoryBlock>,
 }
 
 impl Image {
@@ -288,18 +287,21 @@ impl Image {
 
     pub fn new(
         renderer: &Renderer,
+        pool: &ResourcePool,
         memory_flags: vk::MemoryPropertyFlags,
         req: ImageReq,
-    ) -> Result<Rc<Self>> {
-        Self::from_raw(&renderer.device, memory_flags, &req, &req)
+    ) -> Result<Res<Self>> {
+        Self::from_raw(renderer.device.clone(), pool, memory_flags, &req, &req)
     }
 
+    /// Create image from raw [`vk::ImageCreateInfo`] and [`vk::ImageViewCreateInfo`].
     pub fn from_raw<I, V>(
-        device: &Device,
+        device: Res<Device>,
+        pool: &ResourcePool,
         memory_flags: vk::MemoryPropertyFlags,
         image_info: &I,
         view_info: &V,
-    ) -> Result<Rc<Self>>
+    ) -> Result<Res<Self>>
     where
         I: Into<vk::ImageCreateInfo> + Clone + Copy,
         V: Into<vk::ImageViewCreateInfo> + Clone + Copy,
@@ -323,7 +325,7 @@ impl Image {
             let alloc_info = vk::MemoryAllocateInfo::builder()
                 .allocation_size(requirements.size)
                 .memory_type_index(memory_type);
-            MemoryBlock::new(&device, memory_flags, &alloc_info)?
+            pool.alloc(MemoryBlock::new(device.clone(), memory_flags, &alloc_info)?)
         };
 
         unsafe { device.handle.bind_image_memory(handle, block.handle, 0)?; }
@@ -333,7 +335,7 @@ impl Image {
 
         let view = unsafe { device.handle.create_image_view(&view_info, None)? };
 
-        Ok(Rc::new(Image {
+        Ok(pool.alloc(Image {
             layout: Cell::new(image_info.initial_layout),
             extent: image_info.extent,
             format: image_info.format,
@@ -360,18 +362,20 @@ impl Drop for Image {
 
 pub fn create_images(
     renderer: &Renderer,
+    pool: &ResourcePool,
     memory_flags: vk::MemoryPropertyFlags,
     reqs: &[ImageReq],
-) -> Result<(Vec<Rc<Image>>, Handle<MemoryBlock>)> {
-    create_images_raw(&renderer.device, memory_flags, reqs, reqs)
+) -> Result<(Vec<Res<Image>>, Res<MemoryBlock>)> {
+    create_images_raw(renderer.device.clone(), pool, memory_flags, reqs, reqs)
 }
 
 pub fn create_images_raw<I, V>(
-    device: &Device,
+    device: Res<Device>,
+    pool: &ResourcePool,
     memory_flags: vk::MemoryPropertyFlags,
     image_infos: &[I],
     view_infos: &[V],
-) -> Result<(Vec<Rc<Image>>, Handle<MemoryBlock>)>
+) -> Result<(Vec<Res<Image>>, Res<MemoryBlock>)>
 where
     I: Into<vk::ImageCreateInfo> + Clone + Copy,
     V: Into<vk::ImageViewCreateInfo> + Clone + Copy,
@@ -423,7 +427,7 @@ where
         let alloc_info = vk::MemoryAllocateInfo::builder()
             .allocation_size(current_size)
             .memory_type_index(memory_type);
-        MemoryBlock::new(&device, memory_flags, &alloc_info)?
+        pool.alloc(MemoryBlock::new(device.clone(), memory_flags, &alloc_info)?)
     };
 
     let images: Result<Vec<_>> = images
@@ -437,7 +441,7 @@ where
 
             let view = device.handle.create_image_view(&info, None)?;
 
-            Ok(Rc::new(Image {
+            Ok(pool.alloc(Image {
                 handle: image.handle,
                 layout: Cell::new(image.layout),
                 format: image.format,
@@ -455,11 +459,11 @@ where
 #[derive(Clone)]
 pub struct TextureSampler {
     pub handle: vk::Sampler,
-    device: Device,
+    device: Res<Device>,
 }
 
 impl TextureSampler {
-    pub fn new(renderer: &Renderer) -> Result<Handle<Self>> {
+    pub fn new(renderer: &Renderer) -> Result<Self> {
         let device = renderer.device.clone(); 
         let create_info = vk::SamplerCreateInfo::builder() .mag_filter(vk::Filter::LINEAR) .min_filter(vk::Filter::LINEAR)
             .address_mode_u(vk::SamplerAddressMode::REPEAT)
@@ -476,7 +480,7 @@ impl TextureSampler {
             .min_lod(0.0)
             .max_lod(0.0);
         let handle = unsafe { device.handle.create_sampler(&create_info, None)? };
-        Ok(Handle::new(Self { handle, device }))
+        Ok(Self { handle, device })
     }
 }
 
@@ -683,6 +687,14 @@ pub struct Res<T> {
     pool: ResourcePool,
 }
 
+impl<T> Res<T> {
+    unsafe fn drop_in_place(&mut self) {
+        if mem::needs_drop::<T>() {
+            ptr::drop_in_place::<T>((&mut self.ptr.as_mut().val) as *mut T);
+        }
+    }
+}
+
 impl<T> Clone for Res<T> {
     fn clone(&self) -> Self {
         if mem::needs_drop::<T>() {
@@ -700,7 +712,7 @@ impl<T> Drop for Res<T> {
         if mem::needs_drop::<T>() {
             unsafe {
                 if self.ptr.as_ref().ref_count.get() == 1 {
-                    ptr::drop_in_place::<T>((&mut self.ptr.as_mut().val) as *mut T);
+                    self.drop_in_place();
                 } else {
                     self.ptr.as_ref().ref_count.set(self.ptr.as_ref().ref_count.get() - 1);
                 }

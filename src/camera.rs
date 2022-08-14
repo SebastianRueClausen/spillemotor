@@ -6,11 +6,10 @@ use anyhow::Result;
 
 use std::{mem, iter};
 use std::time::Duration;
-use std::rc::Rc;
 
 use crate::core::*;
 use crate::InputState;
-use crate::resource::{self, MappedMemory, Buffer};
+use crate::resource::{self, MappedMemory, Buffer, ResourcePool, Res};
 
 pub struct Camera {
     pub pos: Vec3,
@@ -173,12 +172,12 @@ impl ProjUniform {
 /// | 1     | view    |
 ///
 pub struct CameraUniforms {
-    buffers: Vec<Rc<Buffer>>,
+    buffers: Vec<Res<Buffer>>,
     mapped: MappedMemory,
 }
 
 impl CameraUniforms {
-    pub fn new(renderer: &Renderer, camera: &Camera) -> Result<Self> {
+    pub fn new(renderer: &Renderer, pool: &ResourcePool, camera: &Camera) -> Result<Self> {
         let proj_info = vk::BufferCreateInfo::builder()
             .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -205,6 +204,7 @@ impl CameraUniforms {
 
         let (buffers, block) = resource::create_buffers(
             &renderer,
+            &pool,
             &infos,
             memory_flags,
             alignment,
@@ -233,12 +233,11 @@ impl CameraUniforms {
             .copy_from_slice(bytemuck::bytes_of(&proj));
     }
 
-    pub fn proj_uniform(&self) -> &Rc<Buffer> {
+    pub fn proj_uniform(&self) -> &Res<Buffer> {
         &self.buffers[0]
     }
 
-    pub fn view_uniform(&self, frame: usize) -> &Rc<Buffer> {
+    pub fn view_uniform(&self, frame: usize) -> &Res<Buffer> {
         &self.buffers[1 + frame]
     }
 }
-

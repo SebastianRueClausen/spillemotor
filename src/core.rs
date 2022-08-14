@@ -7,42 +7,37 @@ use arrayvec::ArrayVec;
 
 use std::ffi::{self, CStr, CString};
 use std::{iter, mem, ops, slice};
-use std::rc::Rc;
 use std::cell::Cell;
 
-use crate::handle::Handle;
-use crate::resource::{self, Image, Buffer, TextureSampler};
+use crate::resource::{self, Image, Buffer, TextureSampler, ResourcePool, Res};
 
 pub struct Renderer {
-    pub device: Device,
+    pub device: Res<Device>,
     pub swapchain: Swapchain,
     render_pass: RenderPass,
     frame_queue: FrameQueue,
     render_targets: RenderTargets,
+    pool: ResourcePool,
 }
 
 impl Renderer {
     pub fn new(window: &winit::window::Window) -> Result<Self> {
-        let device = Device::new(window)?;
+        let pool = ResourcePool::with_block_size(256);
+
+        let device = pool.alloc(Device::new(window)?);
         let window_extent = vk::Extent2D {
             width: window.inner_size().width,
             height: window.inner_size().height,
         };
 
-        let swapchain = Swapchain::new(&device, window_extent)?;
-        let render_targets = RenderTargets::new(&device, &swapchain)?;
-        let render_pass = RenderPass::new(&device, &swapchain, &render_targets)?;
-        let frame_queue = FrameQueue::new(&device)?;
+        let swapchain = Swapchain::new(device.clone(), window_extent)?;
+        let render_targets = RenderTargets::new(device.clone(), &pool, &swapchain)?;
+        let render_pass = RenderPass::new(device.clone(), &swapchain, &render_targets)?;
+        let frame_queue = FrameQueue::new(device.clone())?;
 
         device.wait_until_idle();
 
-        Ok(Self {
-            device,
-            swapchain,
-            render_pass,
-            frame_queue,
-            render_targets,
-        })
+        Ok(Self { device, swapchain, render_pass, frame_queue, render_targets, pool })
     }
 
     pub fn draw<P, R>(&self, pre: P, render: R) -> Result<()>
@@ -187,8 +182,18 @@ impl Renderer {
         };
 
         self.swapchain.recreate(extent)?;
-        self.render_targets = RenderTargets::new(&self.device, &self.swapchain)?;
-        self.render_pass = RenderPass::new(&self.device, &self.swapchain, &self.render_targets)?;
+
+        self.render_targets = RenderTargets::new(
+            self.device.clone(),
+            &self.pool,
+            &self.swapchain,
+        )?;
+
+        self.render_pass = RenderPass::new(
+            self.device.clone(),
+            &self.swapchain,
+            &self.render_targets,
+        )?;
 
         self.device.wait_until_idle();
 
@@ -204,7 +209,7 @@ impl Drop for Renderer {
 
 /// The device and data connected to the device used for rendering. This struct data is static
 /// after creation and doesn't depend on external factors such as display size.
-pub struct DeviceHandle {
+pub struct Device {
     /// Name of `physical`, for instance "GTX 770".
     #[allow(dead_code)]
     name: String,
@@ -238,26 +243,7 @@ pub struct DeviceHandle {
     transfer_pool: vk::CommandPool,
 }
 
-#[derive(Clone)]
-pub struct Device {
-    shared: Rc<DeviceHandle>,
-}
-
-impl ops::Deref for Device {
-    type Target = DeviceHandle;
-    
-    fn deref(&self) -> &Self::Target {
-        &self.shared
-    }
-}
-
 impl Device {
-    pub fn new(window: &winit::window::Window) -> Result<Self> {
-        Ok(Self { shared: Rc::new(DeviceHandle::new(window)?) })
-    }
-}
-
-impl DeviceHandle {
     pub fn new(window: &winit::window::Window) -> Result<Self> {
         let entry = unsafe { ash::Entry::load()? };
 
@@ -544,12 +530,19 @@ impl DeviceHandle {
     }
 }
 
-impl Drop for DeviceHandle {
+impl Drop for Device {
     fn drop(&mut self) {
         unsafe {
             self.handle.destroy_command_pool(self.graphics_pool, None);
             self.handle.destroy_command_pool(self.transfer_pool, None);
             self.handle.destroy_device(None);
+
+            // These are here because the "drop-glue" code, for some reasson isn't called or called
+            // after this code when dropping in place, and they *need* to be called before
+            // destroying the instance, or else the program seg faults when closed.
+            self.messenger.loader.destroy_debug_utils_messenger(self.messenger.handle, None);
+            self.surface.loader.destroy_surface(self.surface.handle, None);
+
             self.instance.destroy_instance(None);
         }
     }
@@ -571,12 +564,6 @@ impl DebugMessenger {
         let handle = unsafe { loader.create_debug_utils_messenger(&info, None)? };
 
         Ok(Self { loader, handle })
-    }
-}
-
-impl Drop for DebugMessenger {
-    fn drop(&mut self) {
-        unsafe { self.loader.destroy_debug_utils_messenger(self.handle, None); }
     }
 }
 
@@ -622,11 +609,11 @@ struct RenderPass {
     ///
     framebuffers: Vec<vk::Framebuffer>,
 
-    device: Device,
+    device: Res<Device>,
 }
 
 impl RenderPass {
-    fn new(device: &Device, swapchain: &Swapchain, render_targets: &RenderTargets) -> Result<Self> {
+    fn new(device: Res<Device>, swapchain: &Swapchain, render_targets: &RenderTargets) -> Result<Self> {
         let attachments = [
             // Swapchain image.
             vk::AttachmentDescription::builder()
@@ -794,13 +781,7 @@ impl Frame {
         let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
         let ready_to_draw = unsafe { device.handle.create_fence(&fence_info, None)? };
 
-        Ok(Self {
-            presented,
-            rendered,
-            ready_to_draw,
-            command_buffer,
-            index,
-        })
+        Ok(Self { presented, rendered, ready_to_draw, command_buffer, index })
     }
 }
 
@@ -810,11 +791,11 @@ struct FrameQueue {
     /// rendering of the next image begins.
     frame_index: Cell<usize>,
 
-    device: Device,
+    device: Res<Device>,
 }
 
 impl FrameQueue {
-    pub fn new(device: &Device) -> Result<Self> {
+    pub fn new(device: Res<Device>) -> Result<Self> {
         let command_buffers = unsafe {
             let command_buffer_info = vk::CommandBufferAllocateInfo::builder()
                 .command_pool(device.graphics_pool)
@@ -824,7 +805,7 @@ impl FrameQueue {
         let frames: Result<Vec<_>> = command_buffers
             .into_iter()
             .enumerate()
-            .map(|(i, buffer)| Frame::new(device, i, buffer))
+            .map(|(i, buffer)| Frame::new(&device, i, buffer))
             .collect();
         let frame_index = Cell::new(0_usize);
         Ok(Self { frames: frames?, frame_index, device: device.clone() })
@@ -938,12 +919,6 @@ impl Surface {
     }
 }
 
-impl Drop for Surface {
-    fn drop(&mut self) {
-        unsafe { self.loader.destroy_surface(self.handle, None) }
-    }
-}
-
 struct SwapchainImage {
     #[allow(dead_code)]
     image: vk::Image,
@@ -986,12 +961,12 @@ struct RenderTargets {
     /// | 1     | depth |
     /// | 1     | msaa  |
     ///
-    images: Vec<Rc<Image>>,
+    images: Vec<Res<Image>>,
     sample_count: vk::SampleCountFlags,
 }
 
 impl RenderTargets {
-    fn new(device: &Device, swapchain: &Swapchain) -> Result<Self> {
+    fn new(device: Res<Device>, pool: &ResourcePool, swapchain: &Swapchain) -> Result<Self> {
         let queue_families = [device.graphics_queue.family_index];
 
         let extent = vk::Extent3D {
@@ -1061,7 +1036,8 @@ impl RenderTargets {
             .take(FRAMES_IN_FLIGHT * 2)
             .collect();
         let (images, _) = resource::create_images_raw(
-            device,
+            device.clone(),
+            pool,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             &image_infos,
             &view_infos,
@@ -1086,20 +1062,18 @@ pub struct Swapchain {
 
     images: Vec<SwapchainImage>,
 
-    device: Device,
+    device: Res<Device>,
 }
 
 enum NextSwapchainImage {
-    UpToDate {
-        image_index: u32,
-    },
+    UpToDate { image_index: u32 },
     OutOfDate,
 }
 
 impl Swapchain {
     /// Create a new swapchain. `extent` is used to determine the size of the swapchain images only
     /// if it aren't able to determine it from `surface`.
-    pub fn new(device: &Device, extent: vk::Extent2D) -> Result<Self> {
+    pub fn new(device: Res<Device>, extent: vk::Extent2D) -> Result<Self> {
         let (surface_formats, _present_modes, surface_caps) = unsafe {
             let format = device
                 .surface
@@ -1179,7 +1153,7 @@ impl Swapchain {
 
         let images: Result<Vec<_>> = images
             .into_iter()
-            .map(|image| SwapchainImage::new(device, image, surface_format.format))
+            .map(|image| SwapchainImage::new(&device, image, surface_format.format))
             .collect();
 
         Ok(Self {
@@ -1312,7 +1286,7 @@ pub struct ShaderModule {
     handle: vk::ShaderModule,
     entry: CString,
 
-    device: Device,
+    device: Res<Device>,
 }
 
 impl ShaderModule {
@@ -1393,29 +1367,28 @@ impl LayoutBindings {
 }
 
 pub enum DescriptorBinding<const N: usize> {
-    Buffer([Rc<Buffer>; N]),
-    Image(Handle<TextureSampler>, [Rc<Image>; N]),
+    Buffer([Res<Buffer>; N]),
+    Image(Res<TextureSampler>, [Res<Image>; N]),
 }
 
-#[derive(Clone)]
 pub struct DescriptorSetLayout {
     pub handle: vk::DescriptorSetLayout,
-    bindings: Rc<LayoutBindings>,
-    device: Device, 
+    bindings: LayoutBindings,
+    device: Res<Device>, 
 }
 
 impl DescriptorSetLayout {
-    pub fn new(renderer: &Renderer, bindings: &[LayoutBinding]) -> Result<Handle<Self>> {
+    pub fn new(renderer: &Renderer, bindings: &[LayoutBinding]) -> Result<Self> {
         Self::create(renderer, LayoutBindings::new(bindings))
     }
 
-    fn create(renderer: &Renderer, bindings: LayoutBindings) -> Result<Handle<Self>> {
+    fn create(renderer: &Renderer, bindings: LayoutBindings) -> Result<Self> {
         let device = renderer.device.clone();
         let layout_info = vk::DescriptorSetLayoutCreateInfo::builder()
             .bindings(&bindings.bindings)
             .build();
         let handle = unsafe { device.handle.create_descriptor_set_layout(&layout_info, None)? };
-        Ok(Handle::new(Self {handle, bindings: Rc::new(bindings), device }))
+        Ok(Self { handle, bindings, device })
     }
 }
 
@@ -1426,21 +1399,21 @@ impl Drop for DescriptorSetLayout {
 }
 
 enum BoundResource {
-    Sampler(Handle<TextureSampler>),
-    Buffer(Rc<Buffer>),
-    Image(Rc<Image>),
+    Sampler(Res<TextureSampler>),
+    Buffer(Res<Buffer>),
+    Image(Res<Image>),
 }
 
-#[derive(Clone)]
 pub struct DescriptorSet {
-    pub layout: Handle<DescriptorSetLayout>,
+    pub layout: Res<DescriptorSetLayout>,
 
     pub pool: vk::DescriptorPool,
     pub sets: ArrayVec<vk::DescriptorSet, FRAMES_IN_FLIGHT>,
 
     #[allow(dead_code)]
-    resources: Rc<SmallVec<[BoundResource; 32]>>,
-    device: Device,
+    resources: SmallVec<[BoundResource; 32]>,
+
+    device: Res<Device>,
 }
 
 impl ops::Index<usize> for DescriptorSet {
@@ -1454,7 +1427,7 @@ impl ops::Index<usize> for DescriptorSet {
 impl DescriptorSet {
     pub fn new_single(
         renderer: &Renderer,
-        layout: Handle<DescriptorSetLayout>,
+        layout: Res<DescriptorSetLayout>,
         bindings: &[DescriptorBinding<1>],
     ) -> Result<Self> {
         Self::new(renderer, layout, bindings)
@@ -1462,7 +1435,7 @@ impl DescriptorSet {
 
     pub fn new_per_frame(
         renderer: &Renderer,
-        layout: Handle<DescriptorSetLayout>,
+        layout: Res<DescriptorSetLayout>,
         bindings: &[DescriptorBinding<FRAMES_IN_FLIGHT>],
     ) -> Result<Self> {
         Self::new(renderer, layout, bindings)
@@ -1470,7 +1443,7 @@ impl DescriptorSet {
 
     fn new<const N: usize>(
         renderer: &Renderer,
-        layout: Handle<DescriptorSetLayout>,
+        layout: Res<DescriptorSetLayout>,
         bindings: &[DescriptorBinding<N>],
     ) -> Result<Self> {
         let device = renderer.device.clone();
@@ -1498,7 +1471,7 @@ impl DescriptorSet {
         };
 
         let sets = unsafe {
-            let layouts: SmallVec<[_; 12]> = std::iter::repeat(layout.clone())
+            let layouts: SmallVec<[_; 12]> = iter::repeat(layout.clone())
                 .take(N)
                 .map(|layout| layout.handle)
                 .collect();
@@ -1578,8 +1551,6 @@ impl DescriptorSet {
             }
         }
 
-        let resources = Rc::new(resources);
-
         let sets = {
             let mut array = ArrayVec::default();
             for set in sets.into_iter() {
@@ -1602,19 +1573,18 @@ impl Drop for DescriptorSet {
 pub struct PipelineLayout {
     pub handle: vk::PipelineLayout,
 
-    // TODO: Make Rc.
     #[allow(dead_code)]
-    descriptor_layouts: SmallVec<[Handle<DescriptorSetLayout>; 2]>,
+    descriptor_layouts: SmallVec<[Res<DescriptorSetLayout>; 2]>,
 
-    device: Device,
+    device: Res<Device>,
 }
 
 impl PipelineLayout {
     pub fn new(
         renderer: &Renderer,
         consts: &[vk::PushConstantRange],
-        layouts: &[Handle<DescriptorSetLayout>],
-    ) -> Result<Handle<Self>> {
+        layouts: &[Res<DescriptorSetLayout>],
+    ) -> Result<Self> {
         let device = renderer.device.clone();
 
         let handle = unsafe {
@@ -1633,7 +1603,7 @@ impl PipelineLayout {
             descriptor_layouts.push(layout.clone());
         }
 
-        Ok(Handle::new(Self { handle, descriptor_layouts, device }))
+        Ok(Self { handle, descriptor_layouts, device })
     }
 }
 
@@ -1645,15 +1615,15 @@ impl Drop for PipelineLayout {
 
 pub struct ComputePipeline {
     handle: vk::Pipeline,
-    layout: Handle<PipelineLayout>,
 
-    device: Device,
+    layout: Res<PipelineLayout>,
+    device: Res<Device>,
 }
 
 impl ComputePipeline {
     pub fn new(
         renderer: &Renderer,
-        layout: Handle<PipelineLayout>,
+        layout: Res<PipelineLayout>,
         shader: &ShaderModule,
     ) -> Result<Self> {
         let device = renderer.device.clone();
@@ -1685,7 +1655,7 @@ impl Drop for ComputePipeline {
 }
 
 pub struct GraphicsPipelineReq<'a> {
-    pub layout: Handle<PipelineLayout>,
+    pub layout: Res<PipelineLayout>,
     pub vertex_attributes: &'a [vk::VertexInputAttributeDescription],
     pub vertex_bindings: &'a [vk::VertexInputBindingDescription],
     pub depth_stencil_info: &'a vk::PipelineDepthStencilStateCreateInfo,
@@ -1695,9 +1665,9 @@ pub struct GraphicsPipelineReq<'a> {
 
 pub struct GraphicsPipeline {
     pub handle: vk::Pipeline,
-    pub layout: Handle<PipelineLayout>,
 
-    device: Device,
+    layout: Res<PipelineLayout>,
+    device: Res<Device>,
 }
 
 impl GraphicsPipeline {
@@ -1795,7 +1765,7 @@ pub struct CommandRecorder {
     pub buffer: vk::CommandBuffer,
     frame_index: usize,
 
-    // TODO: Make this `Device` when we do some refactoring.
+    // TODO: Make this `Res<Device>` when we do some refactoring.
     device: ash::Device,
 }
 

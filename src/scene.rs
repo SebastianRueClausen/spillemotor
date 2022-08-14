@@ -4,13 +4,13 @@ use ash::vk;
 
 use std::mem;
 use std::ops::Index;
-use std::rc::Rc;
 
 use crate::light::Lights;
 use crate::core::*;
-use crate::handle::Handle;
 use crate::camera::CameraUniforms;
-use crate::resource::{self, Buffer, Image, ImageReq, MappedMemory, TextureSampler};
+use crate::resource::{
+    self, Buffer, Image, ImageReq, MappedMemory, TextureSampler, ResourcePool, Res,
+};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -55,8 +55,8 @@ pub struct Material {
 }
 
 pub struct Materials {
-    pub images: Vec<Rc<Image>>, 
-    pub sampler: Handle<TextureSampler>,
+    pub images: Vec<Res<Image>>, 
+    pub sampler: Res<TextureSampler>,
     materials: Vec<Material>,
 }
 
@@ -73,12 +73,13 @@ pub struct Scene {
     pub light_descriptor: DescriptorSet,
     pub materials: Materials,
     pub models: Vec<Model>,
-    pub buffers: Vec<Rc<Buffer>>,
+    pub buffers: Vec<Res<Buffer>>,
 }
 
 impl Scene {
     pub fn from_scene_data(
         renderer: &Renderer,
+        pool: &ResourcePool,
         camera_uniforms: &CameraUniforms,
         lights: &Lights,
         scene_data: &SceneData,
@@ -102,6 +103,7 @@ impl Scene {
 
             let (buffers, block) = resource::create_buffers(
                 &renderer,
+                &pool,
                 &create_infos,
                 memory_flags,
                 4,
@@ -140,6 +142,7 @@ impl Scene {
 
             let (buffers, _) = resource::create_buffers(
                 &renderer,
+                &pool,
                 &create_infos,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 4,
@@ -181,6 +184,7 @@ impl Scene {
 
             let (staging, block) = resource::create_buffers(
                 &renderer,
+                &pool,
                 &create_infos,
                 memory_flags,
                 4,
@@ -242,6 +246,7 @@ impl Scene {
 
             let (images, _) = resource::create_images(
                 &renderer,
+                &pool,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 &image_reqs,
             )?;
@@ -281,7 +286,7 @@ impl Scene {
             })
             .collect();
 
-        let layout = DescriptorSetLayout::new(&renderer, &[
+        let layout = pool.alloc(DescriptorSetLayout::new(&renderer, &[
             LayoutBinding {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
@@ -294,7 +299,7 @@ impl Scene {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
             },
-        ])?;
+        ])?);
 
         let light_descriptor = DescriptorSet::new_per_frame(&renderer, layout, &[
             DescriptorBinding::Buffer([
@@ -311,9 +316,9 @@ impl Scene {
             ]),
         ])?;
 
-        let sampler = TextureSampler::new(&renderer)?;
+        let sampler = pool.alloc(TextureSampler::new(&renderer)?);
 
-        let descriptor_layout = DescriptorSetLayout::new(&renderer, &[
+        let descriptor_layout = pool.alloc(DescriptorSetLayout::new(&renderer, &[
             LayoutBinding {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
                 stage: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
@@ -334,7 +339,7 @@ impl Scene {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 stage: vk::ShaderStageFlags::FRAGMENT,
             },
-        ])?;
+        ])?);
 
         let materials: Result<Vec<_>> = scene_data.materials
             .iter()
@@ -398,10 +403,10 @@ impl Scene {
                 .offset(0)
                 .build()];
 
-            let layout = PipelineLayout::new(&renderer, &push_consts, &[
+            let layout = pool.alloc(PipelineLayout::new(&renderer, &push_consts, &[
                 descriptor_layout.clone(),
                 light_descriptor.layout.clone(),
-            ])?;
+            ])?);
 
             let pipeline = GraphicsPipeline::new(&renderer, GraphicsPipelineReq {
                 layout,
